@@ -1,0 +1,66 @@
+{
+ "init_ssl-accepted": {
+  "async": {
+   "result": null,
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  },
+  "sync": {
+   "result": null,
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  }
+ },
+ "init_ssl-empty": {
+  "async": {
+   "result": "S7ConnectionError: InitSSL response too short",
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  },
+  "sync": {
+   "result": "S7ConnectionError: InitSSL response too short",
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  }
+ },
+ "init_ssl-header_only": {
+  "async": {
+   "result": null,
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  },
+  "sync": {
+   "result": null,
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  }
+ },
+ "init_ssl-nine_bytes": {
+  "async": {
+   "result": "S7ConnectionError: InitSSL response too short",
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  },
+  "sync": {
+   "result": "S7ConnectionError: InitSSL response too short",
+   "sent": [
+    "7201001231000005b30000000000000000300000000072010000"
+   ],
+   "sequence_number": 1
+  }
+ }
+}

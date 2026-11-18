@@ -17,12 +17,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import ssl
 import struct
 from collections import deque
 from enum import Enum, auto
 from typing import Generator, NamedTuple, Optional
 
+from ._tls import _S7_CIPHERS, _derive_oms_secret, _set_s7_groups, _verify_pinned_certificate
 from ._handshake import (
+    _build_session_activate_payload,
+    _check_set_variable_response,
+    _renews_session_key,
     _build_get_var_substreamed_payload,
     _build_set_variable_payload,
     _build_v1_get_var_substreamed_payload,
@@ -382,6 +387,13 @@ class SessionCore:
     _notification_frame_overflows: int
     _protection_level: Optional[int]
     _oms_secret: Optional[bytes]
+    _session_key_refresh_interval: Optional[float]
+    _connected: bool
+    _incoming_bio: Optional[ssl.MemoryBIO]
+    _outgoing_bio: Optional[ssl.MemoryBIO]
+    _ssl_object: Optional[ssl.SSLObject]
+    _peer_certificate_fingerprint: Optional[bytes]
+    _tls_cert_fingerprint: Optional[bytes]
     _server_session_version: Optional[bytes]
 
     @property
@@ -1140,3 +1152,218 @@ class SessionCore:
                 del buf[:4]  # consume trailer: last fragment
                 break
         return bytes(data)
+
+    # --- InitSSL and TLS inside COTP ---
+    #
+    # S7CommPlus carries TLS records as the payload of COTP data frames, so the
+    # session drives an ``ssl.SSLObject`` over memory BIOs; the clients run the
+    # handshake loop, which needs I/O, between `_start_tls_session` and
+    # `_tls_session_established`.
+
+    def peer_certificate_fingerprint(self) -> Optional[bytes]:
+        """SHA-256 of the TLS certificate the PLC presented, or None without TLS.
+
+        The raw 32-byte digest; ``.hex()`` gives the hex string that
+        ``tls_cert_fingerprint`` takes.
+        """
+        return self._peer_certificate_fingerprint
+
+    def _encode_init_ssl(self) -> _PendingRequest:
+        """Frame the InitSSL request, the first S7CommPlus message after the COTP connection.
+
+        The PLC responds with an InitSSL response. For PLCs that support
+        TLS, the caller should then activate TLS before sending CreateObject.
+        For V1 PLCs without TLS, the response may indicate that TLS is
+        not supported, but the connection can continue without it.
+
+        Reference: thomas-v2/S7CommPlusDriver InitSslRequest
+        """
+        seq_num = self._next_sequence_number()
+
+        # InitSSL request: header + padding
+        request = struct.pack(
+            ">BHHHHIB",
+            Opcode.REQUEST,
+            0x0000,  # Reserved
+            FunctionCode.INIT_SSL,
+            0x0000,  # Reserved
+            seq_num,
+            0x00000000,  # No session yet
+            0x30,  # Transport flags (0x30 for InitSSL)
+        )
+        # Trailing padding
+        request += struct.pack(">I", 0)
+
+        # Wrap in S7CommPlus frame header + trailer
+        frame = encode_header(ProtocolVersion.V1, len(request)) + request
+        frame += struct.pack(">BBH", 0x72, ProtocolVersion.V1, 0x0000)
+        logger.debug("=== InitSSL === sending (%d bytes): %s", len(frame), _HexDump(frame))
+        return _PendingRequest(FunctionCode.INIT_SSL, seq_num, frame, None)
+
+    def _check_init_ssl_reply(self, response_frame: bytes) -> None:
+        """Raise unless the InitSSL reply carries at least a response header."""
+        logger.debug("=== InitSSL === received (%d bytes): %s", len(response_frame), _HexDump(response_frame))
+        version, data_length, consumed = decode_header(response_frame)
+        response = response_frame[consumed : consumed + data_length]
+        if len(response) < 10:
+            raise S7ConnectionError("InitSSL response too short")
+        logger.debug(f"InitSSL response: version=V{version}, data_length={data_length}")
+        logger.debug("InitSSL response body (%d bytes): %s", len(response), _HexDump(response))
+
+    def _setup_ssl_context(
+        self,
+        cert_path: Optional[str] = None,
+        key_path: Optional[str] = None,
+        ca_path: Optional[str] = None,
+    ) -> ssl.SSLContext:
+        """Create TLS context for S7CommPlus.
+
+        Args:
+            cert_path: Client certificate path (PEM)
+            key_path: Client private key path (PEM)
+            ca_path: PLC CA certificate path (PEM)
+
+        Returns:
+            Configured SSLContext
+        """
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        ctx.set_ciphers(_S7_CIPHERS)
+        _set_s7_groups(ctx)
+        ctx.options |= ssl.OP_NO_TICKET
+        ctx.options |= 0x00080000  # SSL_OP_NO_ENCRYPT_THEN_MAC
+        ctx.options |= 0x00000001  # SSL_OP_NO_EXTENDED_MASTER_SECRET (OpenSSL 3.0+)
+
+        if cert_path and key_path:
+            ctx.load_cert_chain(cert_path, key_path)
+
+        if ca_path:
+            ctx.load_verify_locations(ca_path)
+        else:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+        return ctx
+
+    def _start_tls_session(self, ctx: ssl.SSLContext, host: Optional[str]) -> None:
+        """Create the memory-BIO TLS session over which the handshake runs.
+
+        The S7CommPlus protocol transports TLS records as the payload of COTP
+        DT frames; TPKT and COTP headers stay unencrypted on the wire. A
+        standard ``ssl.wrap_socket`` (or ``start_tls``) would encrypt
+        everything, including TPKT/COTP, which Siemens PLCs reject. Memory
+        BIOs encrypt and decrypt without touching the TCP socket.
+        """
+        self._incoming_bio = ssl.MemoryBIO()
+        self._outgoing_bio = ssl.MemoryBIO()
+        self._ssl_object = ctx.wrap_bio(
+            self._incoming_bio,
+            self._outgoing_bio,
+            server_side=False,
+            server_hostname=host if ctx.check_hostname else None,
+        )
+
+    def _tls_session_established(self, keylog_path: str) -> None:
+        """After the handshake: pin the PLC certificate and derive the OMS secret from the key log.
+
+        Raises:
+            S7ConnectionError: The TLS session was closed during the handshake.
+            S7CertificateError: The certificate does not match the pin.
+        """
+        self._tls_active = True
+        # Pin the PLC certificate before any application data is trusted.
+        # Not an assert: the check must also hold under ``python -O``.
+        if self._ssl_object is None:
+            raise S7ConnectionError("TLS session was closed during the handshake")
+        self._peer_certificate_fingerprint = _verify_pinned_certificate(self._ssl_object, self._tls_cert_fingerprint)
+        # The OMS exporter secret, which new legitimation needs, is derived
+        # from the handshake's key log (see _tls_key_log).
+        self._oms_secret = _derive_oms_secret(self._ssl_object, keylog_path)
+        logger.info("TLS activated (tunneled inside COTP frames)")
+
+    # --- SessionKey renewal, session activation and closing ---
+    #
+    # The clients schedule renewals their own way (a timer thread, an asyncio
+    # task) and run the exchange under their request lock; these decide and
+    # build its steps.
+
+    def _renewal_interval(self) -> Optional[float]:
+        """Seconds until the next SessionKey renewal, or None when none is to be sent."""
+        interval = self._session_key_refresh_interval
+        if interval is None or self._session_key is None or not self._connected:
+            return None
+        if not _renews_session_key(self._v1_session_key_family):
+            logger.info(
+                "Automatic SessionKey renewal is not sent for key family %02x, which refuses it; "
+                "the PLC ends the session when the key expires, so reconnect before then",
+                int(self._v1_session_key_family),
+            )
+            return None
+        return interval
+
+    def _renewal_challenge_payload(self) -> bytes:
+        """The GetVarSubStreamed that reads a renewal challenge while the old key is active.
+
+        Not the family-specific layout of the post-auth legitimation: a CPU 1214C
+        FW V4.2 (key family 01) rejects that one mid-session and accepts this
+        one, after which the renewal completes (#169).
+
+        Raises:
+            S7ConnectionError: There is no session key or public key to renew from.
+        """
+        if self._session_key is None or not self._v1_session_key_public_key:
+            raise S7ConnectionError("Legacy SessionKey renewal prerequisites are unavailable")
+        return _build_get_var_substreamed_payload(self._session_id, LegitimationId.SERVER_SESSION_REQUEST)
+
+    def _renewal_request(self, challenge_reply: bytes) -> tuple[bytes, bytes]:
+        """Answer the renewal challenge: the SetVariable payload carrying the SecurityKey, and the new key.
+
+        Raises:
+            S7ConnectionError: The reply carries no 20-byte challenge.
+        """
+        from .v1_session_key.handshake import authenticate_session_key
+
+        challenge = _parse_get_var_substreamed_response(challenge_reply)
+        if len(challenge) != 20:
+            raise S7ConnectionError(f"SessionKey renewal returned an unexpected {len(challenge)}-byte challenge")
+        blob, new_session_key = authenticate_session_key(challenge, self._v1_session_key_public_key, self._v1_session_key_family)
+        security_key = self._encode_security_key_struct(blob, new_session_key)
+        payload = _build_set_variable_payload(self._session_id, LegitimationId.SESSION_SETUP_LEGITIMATION, security_key)
+        return payload, new_session_key
+
+    def _renewed(self, reply: bytes, new_session_key: bytes) -> None:
+        """Switch to ``new_session_key`` once the PLC accepted the SecurityKey in ``reply``."""
+        _check_set_variable_response(reply, self._last_response_function)
+        self._session_key = new_session_key
+        logger.info("Legacy SessionKey renewed successfully")
+
+    def _session_activate_payload(self) -> bytes:
+        """The SetVariable that activates the V3 session after the SecurityKey handshake (address 323 = USINT(5))."""
+        logger.debug("Session activation: SET_VARIABLE addr 323 = USINT(5)")
+        return _build_session_activate_payload(self._session_id, self._sequence_number)
+
+    def _session_activated(self) -> None:
+        """Log how the PLC answered the session activation."""
+        if self._last_response_function == FunctionCode.ERROR:
+            # Not fatal: no PLC is known to need it, and the emulator has no SetVariable.
+            logger.warning("Session activation answered with the generic error function")
+            return
+        logger.info("Session activation completed")
+
+    def _encode_delete_session(self) -> bytes:
+        """Frame the DeleteObject that closes the session."""
+        seq_num = self._next_sequence_number()
+        request = struct.pack(
+            ">BHHHHIB",
+            Opcode.REQUEST,
+            0x0000,
+            FunctionCode.DELETE_OBJECT,
+            0x0000,
+            seq_num,
+            self._session_id,
+            0x34,
+        )
+        request += struct.pack(">I", 0)
+        frame = encode_header(self._protocol_version, len(request)) + request
+        return frame + struct.pack(">BBH", 0x72, self._protocol_version, 0x0000)

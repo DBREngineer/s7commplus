@@ -80,8 +80,6 @@ from .client import (
 from .catalog import SymbolCatalog, SymbolicTag, TagResult
 from .codec import (
     SERVER_SESSION_ROLE_SECURED_BIT,
-    decode_header,
-    encode_header,
     parse_create_object_session_id,
     parse_or_raise_for_return_value,
 )
@@ -89,34 +87,25 @@ from .connection import (
     _DEFAULT_EXPLORE_TIMEOUT,
     _DEFAULT_LEGACY_SESSION_KEY_REFRESH_INTERVAL,
     _MAX_QUEUED_NOTIFICATION_FRAMES,
-    _S7_CIPHERS,
     FamilyOnlyFingerprintError,
     SessionKeyAuthenticationDependencyError,
     SessionKeyCandidateRejectedError,
     _alarm_texts_and_domain_filter,
-    _build_get_var_substreamed_payload,
-    _build_session_activate_payload,
-    _build_set_variable_payload,
     _check_set_variable_response,
     _check_timeout,
     _check_v1_legitimation_response,
-    _derive_oms_secret,
-    _encode_security_key_struct,
     _build_subscription_credit_frame,
     _check_certificate_pin,
     _check_plaintext_fallback,
     _parse_get_var_substreamed_response,
     _resolve_use_tls,
     _parse_protection_level_response,
-    _renews_session_key,
     _request_frame_overhead,
     _resolve_session_key_fingerprint,
-    _set_s7_groups,
     _sends_session_activation,
     _tls_key_log,
     _write_delete_qualifier_version,
     _response_continues,
-    _verify_pinned_certificate,
 )
 from .subscription import (
     SubscriptionDiagnostics,
@@ -148,9 +137,7 @@ from .protocol import (
     DataType,
     FunctionCode,
     Ids,
-    LegitimationId,
     LegitimationType,
-    Opcode,
     remote_tsap_for_connection_type,
     ProtocolVersion,
 )
@@ -829,58 +816,18 @@ class S7CommPlusAsyncClient(SessionCore):
         """Activate TLS over the COTP connection."""
         if self._writer is None:
             raise S7ConnectionError("Cannot activate TLS: not connected")
-
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-
-        ctx.set_ciphers(_S7_CIPHERS)
-        _set_s7_groups(ctx)
-        ctx.options |= ssl.OP_NO_TICKET
-        ctx.options |= 0x00080000  # SSL_OP_NO_ENCRYPT_THEN_MAC
-        ctx.options |= 0x00000001  # SSL_OP_NO_EXTENDED_MASTER_SECRET (OpenSSL 3.0+)
-
-        if tls_cert and tls_key:
-            ctx.load_cert_chain(tls_cert, tls_key)
-
-        if tls_ca:
-            ctx.load_verify_locations(tls_ca)
-        else:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-        # BIO-based TLS: encrypt/decrypt in memory so the TLS records can be tunneled
-        # through COTP DT frames (TPKT/COTP stay unencrypted) — `start_tls` would instead
-        # wrap the whole TCP stream, encrypting TPKT/COTP too, which the PLC rejects.
-        self._incoming_bio = ssl.MemoryBIO()
-        self._outgoing_bio = ssl.MemoryBIO()
-
-        # The OMS exporter secret, which new legitimation needs, is derived
-        # from the handshake's key log (see _tls_key_log).
+        ctx = self._setup_ssl_context(cert_path=tls_cert, key_path=tls_key, ca_path=tls_ca)
         with _tls_key_log(ctx) as keylog_path:
-            self._ssl_object = ctx.wrap_bio(
-                self._incoming_bio,
-                self._outgoing_bio,
-                server_side=False,
-                server_hostname=self._host if ctx.check_hostname else None,
-            )
-
+            # Read the host only when it is checked: it is set by connect().
+            self._start_tls_session(ctx, self._host if ctx.check_hostname else None)
+            # TLS handshake: records tunnel through COTP frames
             try:
                 await self._do_tls_handshake()
             except ssl.SSLCertVerificationError as exc:
                 raise S7CertificateError(f"PLC TLS certificate failed verification: {exc.verify_message}") from exc
             except (ssl.SSLError, OSError, EOFError, asyncio.TimeoutError, S7Error) as exc:
                 raise S7TlsHandshakeError(f"TLS handshake with the PLC did not complete: {exc}") from exc
-            self._tls_active = True
-
-            # Pin the PLC certificate before any application data is trusted.
-            # Not an assert: the check must also hold under ``python -O``.
-            if self._ssl_object is None:
-                raise S7ConnectionError("TLS session was closed during the handshake")
-            self._peer_certificate_fingerprint = _verify_pinned_certificate(self._ssl_object, self._tls_cert_fingerprint)
-
-            self._oms_secret = _derive_oms_secret(self._ssl_object, keylog_path)
-
-        logger.info("TLS activated (tunneled inside COTP frames)")
+            self._tls_session_established(keylog_path)
 
     async def _do_tls_handshake(self) -> None:
         """Perform the TLS handshake, tunneling records through COTP DT frames."""
@@ -984,14 +931,6 @@ class S7CommPlusAsyncClient(SessionCore):
         self._session_key_refresh_error = None
         self._connect_params = None
 
-    def peer_certificate_fingerprint(self) -> Optional[bytes]:
-        """SHA-256 of the PLC's TLS certificate, or None without TLS.
-
-        The raw 32-byte digest; ``.hex()`` gives the hex string that
-        ``tls_cert_fingerprint`` takes.
-        """
-        return self._peer_certificate_fingerprint
-
     async def _close(self) -> None:
         """Tear down the session and transport, keeping the connect parameters and any renewal failure."""
         self._stop_session_key_refresh()
@@ -1087,15 +1026,8 @@ class S7CommPlusAsyncClient(SessionCore):
 
     def _schedule_session_key_refresh(self) -> None:
         """Start renewing an authenticated legacy session's key periodically."""
-        interval = self._session_key_refresh_interval
-        if interval is None or self._session_key is None or not self._connected:
-            return
-        if not _renews_session_key(self._v1_session_key_family):
-            logger.info(
-                "Automatic SessionKey renewal is not sent for key family %02x, which refuses it; "
-                "the PLC ends the session when the key expires, so reconnect before then",
-                int(self._v1_session_key_family),
-            )
+        interval = self._renewal_interval()
+        if interval is None:
             return
         self._session_key_refresh_task = asyncio.get_running_loop().create_task(self._session_key_refresh_loop(interval))
 
@@ -1120,28 +1052,9 @@ class S7CommPlusAsyncClient(SessionCore):
 
     async def _renew_session_key_locked(self) -> None:
         """Perform the challenge/SecurityKey exchange while the old key is active."""
-        if self._session_key is None or not self._v1_session_key_public_key:
-            raise S7ConnectionError("Legacy SessionKey renewal prerequisites are unavailable")
-
-        from .v1_session_key.handshake import authenticate_session_key
-
-        # Not the family-specific layout of the post-auth legitimation: a CPU 1214C
-        # FW V4.2 (key family 01) rejects that one mid-session and accepts this
-        # one, after which the renewal completes (#169).
-        challenge_payload = _build_get_var_substreamed_payload(self._session_id, LegitimationId.SERVER_SESSION_REQUEST)
-        challenge_response = await self._send_request_locked(FunctionCode.GET_VAR_SUBSTREAMED, challenge_payload, 4)
-        challenge = _parse_get_var_substreamed_response(challenge_response)
-        if len(challenge) != 20:
-            raise S7ConnectionError(f"SessionKey renewal returned an unexpected {len(challenge)}-byte challenge")
-        blob, new_session_key = authenticate_session_key(challenge, self._v1_session_key_public_key, self._v1_session_key_family)
-        security_key = _encode_security_key_struct(
-            self._v1_session_key_public_key, self._v1_session_key_family, blob, new_session_key
-        )
-        renewal_payload = _build_set_variable_payload(self._session_id, LegitimationId.SESSION_SETUP_LEGITIMATION, security_key)
-        renewal_response = await self._send_request_locked(FunctionCode.SET_VARIABLE, renewal_payload, 4)
-        _check_set_variable_response(renewal_response, self._last_response_function)
-        self._session_key = new_session_key
-        logger.info("Legacy SessionKey renewed successfully")
+        challenge_reply = await self._send_request_locked(FunctionCode.GET_VAR_SUBSTREAMED, self._renewal_challenge_payload(), 4)
+        payload, new_session_key = self._renewal_request(challenge_reply)
+        self._renewed(await self._send_request_locked(FunctionCode.SET_VARIABLE, payload, 4), new_session_key)
 
     async def _reconnect(self) -> None:
         """Tear down and re-establish the connection with the same parameters."""
@@ -2466,32 +2379,9 @@ class S7CommPlusAsyncClient(SessionCore):
 
     async def _init_ssl(self) -> None:
         """Send InitSSL request (required before CreateObject)."""
-        seq_num = self._next_sequence_number()
-
-        request = struct.pack(
-            ">BHHHHIB",
-            Opcode.REQUEST,
-            0x0000,
-            FunctionCode.INIT_SSL,
-            0x0000,
-            seq_num,
-            0x00000000,
-            0x30,
-        )
-        request += struct.pack(">I", 0)
-
-        frame = encode_header(ProtocolVersion.V1, len(request)) + request
-        frame += struct.pack(">BBH", 0x72, ProtocolVersion.V1, 0x0000)
-        await self._send_cotp_dt(frame)
-
-        response_data = await self._recv_cotp_dt()
-        version, data_length, consumed = decode_header(response_data)
-        response = response_data[consumed : consumed + data_length]
-
-        if len(response) < 10:
-            raise S7ConnectionError("InitSSL response too short")
-
-        logger.debug(f"InitSSL response received, version=V{version}")
+        pending = self._encode_init_ssl()
+        await self._send_cotp_dt(pending.frame)
+        self._check_init_ssl_reply(await self._recv_cotp_dt())
 
     async def _create_session(self) -> None:
         """Send CreateObject to establish S7CommPlus session."""
@@ -2522,14 +2412,9 @@ class S7CommPlusAsyncClient(SessionCore):
 
     async def _session_activate(self) -> None:
         """Activate the V3 session after the SecurityKey handshake (SET_VARIABLE addr 323 = USINT(5))."""
-        async with self._lock:
-            payload = _build_session_activate_payload(self._session_id, self._sequence_number)
-            await self._send_request_locked(FunctionCode.SET_VARIABLE, payload, integrity_tail=3)
-        if self._last_response_function == FunctionCode.ERROR:
-            # Not fatal: no PLC is known to need it, and the emulator has no SetVariable.
-            logger.warning("Session activation answered with the generic error function")
-            return
-        logger.info("Session activation completed")
+        async with self._lock:  # the payload carries the next sequence number
+            await self._send_request_locked(FunctionCode.SET_VARIABLE, self._session_activate_payload(), integrity_tail=3)
+        self._session_activated()
 
     async def _post_auth_legitimation(self, password: str = "") -> None:
         """Solve the V1 legitimation challenge after the SessionKey handshake (see the sync connection)."""
@@ -2545,24 +2430,7 @@ class S7CommPlusAsyncClient(SessionCore):
 
     async def _delete_session(self) -> None:
         """Send DeleteObject to close the session."""
-        seq_num = self._next_sequence_number()
-
-        request = struct.pack(
-            ">BHHHHIB",
-            Opcode.REQUEST,
-            0x0000,
-            FunctionCode.DELETE_OBJECT,
-            0x0000,
-            seq_num,
-            self._session_id,
-            0x34,
-        )
-        request += struct.pack(">I", 0)
-
-        frame = encode_header(self._protocol_version, len(request)) + request
-        frame += struct.pack(">BBH", 0x72, self._protocol_version, 0x0000)
-        await self._send_cotp_dt(frame)
-
+        await self._send_cotp_dt(self._encode_delete_session())
         try:
             await asyncio.wait_for(self._recv_cotp_dt(), timeout=1.0)
         except Exception:
