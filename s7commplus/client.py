@@ -1837,6 +1837,21 @@ class S7CommPlusClient(_ClientMethods):
 
         return read_cpu_culture_info(self._require_connected())
 
+    @_retry_on_dropped_connection
+    def get_text_lists(self, language_ids: Sequence[int] | None = None):
+        """Read online text-list libraries (language-independent + per LCID).
+
+        When ``language_ids`` is omitted, uses :meth:`get_cpu_culture_info`.
+        Matches S7CommPlusDriver ``GetTextListsAsync``.
+        """
+        from .textlists import read_text_lists
+
+        connection = self._require_connected()
+        culture_ids = None
+        if not language_ids:
+            culture_ids = self.get_cpu_culture_info().language_ids
+        return read_text_lists(connection, language_ids, culture_language_ids=culture_ids)
+
     def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 

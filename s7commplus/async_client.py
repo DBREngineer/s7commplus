@@ -992,6 +992,46 @@ class S7CommPlusAsyncClient(_ClientMethods):
             return CpuCultureInfo(language_ids=())
         return parse_text_container_lcids(response)
 
+    @_retry_on_dropped_connection
+    async def get_text_lists(self, language_ids: Sequence[int] | None = None):
+        """Read online text-list libraries (language-independent + per LCID).
+
+        When ``language_ids`` is omitted, uses :meth:`get_cpu_culture_info`.
+        Matches S7CommPlusDriver ``GetTextListsAsync``.
+        """
+        from .textlists import (
+            TextListCatalog,
+            TextListScope,
+            build_text_list_explore_payload,
+            decode_text_list_library,
+            parse_text_library_explore,
+        )
+
+        connection = self._require_connected()
+        requested = list(dict.fromkeys(int(x) for x in (language_ids or ())))
+        if not requested:
+            requested = list((await self.get_cpu_culture_info()).language_ids)
+
+        lists = []
+        for language_id, relation, scope in (
+            [(0, Ids.TEXT_LIST_LIBRARY_BASE_RELATION_ID, TextListScope.LANGUAGE_INDEPENDENT)]
+            + [
+                (lid, Ids.TEXT_LIST_LIBRARY_BASE_RELATION_ID + (lid & 0xFFFF), TextListScope.LANGUAGE_SPECIFIC)
+                for lid in requested
+                if lid != 0
+            ]
+        ):
+            payload = build_text_list_explore_payload(relation)
+            response = await connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+            parsed = parse_text_library_explore(response)
+            if parsed is None:
+                continue
+            offset_blobs, string_area = parsed
+            lists.extend(
+                decode_text_list_library(offset_blobs[0], offset_blobs[1], string_area, language_id, scope)
+            )
+        return TextListCatalog(tuple(requested), tuple(lists))
+
     async def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 

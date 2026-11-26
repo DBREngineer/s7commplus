@@ -31,6 +31,7 @@ from .client import S7CommPlusClient as Client
 from .connection import S7CommPlusConnection
 from .devices import DEVICE_NAMES, device_family, device_name
 from .metadata import CpuCultureInfo, CpuCycleTime, CpuInfo, CpuMemoryArea, CpuMemoryUsage
+from .textlists import TextList, TextListCatalog, TextListEntry, TextListScope, TextListType
 from .error import (
     S7AuthenticationError,
     S7CertificateError,
@@ -114,6 +115,11 @@ __all__ = [
     "SymbolicTag",
     "Tag",
     "TagResult",
+    "TextList",
+    "TextListCatalog",
+    "TextListEntry",
+    "TextListScope",
+    "TextListType",
     "block_interface_from_explore",
     "datablocks_from_explore",
     "decompress_blob",

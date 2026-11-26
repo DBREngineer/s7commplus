@@ -308,6 +308,13 @@ class Ids(IntEnum):
     TEXT_CONTAINER_CLASS_RID = 4672
     TEXT_CONTAINER_LCIDS = 2717
 
+    # Online text-list library (GetTextLists). Source: S7CommPlusDriver Ids.
+    TEXT_LIBRARY_CLASS_RID = 606
+    TEXT_LIBRARY_OFFSET_AREA = 608
+    TEXT_LIBRARY_STRING_AREA = 609
+    # Base relation for language-independent text lists; add LCID for a language.
+    TEXT_LIST_LIBRARY_BASE_RELATION_ID = 0x8A370000
+
     # Object attributes for EXPLORE responses
     OBJECT_VARIABLE_TYPE_NAME = 233
     # VariableTypeStructModificationTime: when a type-info object's layout last

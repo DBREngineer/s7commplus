@@ -547,6 +547,20 @@ def decode_pvalue_to_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
             raw = data[offset + consumed : offset + consumed + count * elem_size]
             consumed += count * elem_size
             return bytes(raw), consumed
+        if datatype == DataType.BLOB:
+            # AddressArray of Blob: each element is root-id + length + octets (no
+            # nested flags/datatype). Length-prefix the payloads so callers can
+            # recover boundaries (used by TextLibraryOffsetArea).
+            result = bytearray()
+            for _ in range(count):
+                _root, c = decode_uint32_vlq(data, offset + consumed)
+                consumed += c
+                length, c = decode_uint32_vlq(data, offset + consumed)
+                consumed += c
+                payload = data[offset + consumed : offset + consumed + length]
+                consumed += length
+                result += struct.pack(">I", length) + payload
+            return bytes(result), consumed
         else:
             # Variable-length elements (VLQ encoded)
             result = bytearray()
@@ -712,6 +726,14 @@ def skip_typed_value(data: bytes, offset: int, datatype: int, flags: int) -> int
         elem_size = _pvalue_element_size(datatype)
         if elem_size > 0:
             offset += count * elem_size
+        elif datatype == DataType.BLOB:
+            for _ in range(count):
+                if offset >= len(data):
+                    break
+                _root, consumed = decode_uint32_vlq(data, offset)
+                offset += consumed
+                length, consumed = decode_uint32_vlq(data, offset)
+                offset += consumed + length
         else:
             # Variable-length: skip each VLQ element.
             decode, _encode = _vlq_element_codec(datatype)
