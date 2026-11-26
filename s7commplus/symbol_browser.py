@@ -138,14 +138,14 @@ class SymbolBrowser:
                     is_structure=True,
                     native_type_name="DB",
                     has_children=True,
-                    relation_id=int(db.relation_id),
+                    relation_id=int(db.rid),
                 )
                 for db in dbs
             ]
 
         segments = split_symbol_path(symbol_path)
         db, db_segments = self._find_db(dbs, segments)
-        interface = self._interface(int(db.relation_id))
+        interface = self._interface(int(db.rid))
         members = interface.members
         # Walk remaining member segments.
         walked = segments[db_segments:]
@@ -160,7 +160,7 @@ class SymbolBrowser:
             if not members and match.referenced_type:
                 # System/UDT types without embedded fields: no further children here.
                 return []
-        return members_to_browse_nodes(members, parent_path=parent_path, relation_id=int(db.relation_id))
+        return members_to_browse_nodes(members, parent_path=parent_path, relation_id=int(db.rid))
 
     def _dbs(self) -> list[Any]:
         if self._db_cache is None:

@@ -44,9 +44,9 @@ def test_members_to_browse_nodes() -> None:
 
 def test_symbol_browser_top_level_and_expand() -> None:
     class _DB:
-        def __init__(self, name: str, relation_id: int) -> None:
+        def __init__(self, name: str, rid: int) -> None:
             self.name = name
-            self.relation_id = relation_id
+            self.rid = rid
 
     class _Client:
         def list_datablocks(self):
