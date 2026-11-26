@@ -1730,14 +1730,20 @@ class S7CommPlusClient(_ClientMethods):
             S7ReturnValueError: If the PLC answers with a non-zero ReturnValue, e.g. for an object that does not exist.
         """
         connection = self._require_connected()
+        from .metadata import uses_old_firmware_gvs_framing
 
         if connection._session_key is not None:
             explore_id = explore_id or 0x38
             payload = _build_explore_payload_v3(explore_id)
+            integrity_tail = 5
         else:
             explore_id = explore_id or Ids.NATIVE_THE_PLC_PROGRAM_RID
-            payload = _build_explore_request(explore_id, list(attributes or []))
-        response = connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+            with_integrity = not uses_old_firmware_gvs_framing(connection)
+            payload = _build_explore_request(explore_id, list(attributes or []), with_integrity=with_integrity)
+            integrity_tail = 5 if with_integrity else 0
+        response = connection.send_request(
+            FunctionCode.EXPLORE, payload, integrity_tail=integrity_tail, reassemble=True
+        )
         parse_or_raise_for_return_value(response, f"EXPLORE of 0x{explore_id:08X}")
         return response
 
@@ -3009,12 +3015,22 @@ def _parse_operating_state_struct(response: bytes, offset: int) -> Optional[int]
     return None
 
 
-def _build_explore_request(explore_id: int, attribute_ids: list[int]) -> bytes:
+def _build_explore_request(
+    explore_id: int,
+    attribute_ids: list[int],
+    *,
+    explore_childs_recursive: int = 1,
+    explore_parents: int = 0,
+    with_integrity: bool = True,
+) -> bytes:
     """Build a structured EXPLORE request for a specific object.
 
     Args:
         explore_id: RID of the object to explore.
         attribute_ids: List of attribute IDs to request.
+        with_integrity: When false (plaintext S7-1200 FW2.2), the mid flag is 0
+            and the trailer is only a 4-byte fill — matching S7CommPlusDriver
+            ``ExploreRequest.WithIntegrityId = false``.
 
     Returns:
         Encoded EXPLORE payload.
@@ -3022,18 +3038,19 @@ def _build_explore_request(explore_id: int, attribute_ids: list[int]) -> bytes:
     payload = bytearray()
     payload += struct.pack(">I", explore_id)  # ExploreId (fixed UInt32, not VLQ)
     payload += encode_uint32_vlq(0)  # ExploreRequestId (0 = none)
-    payload += bytes([1])  # ExploreChildsRecursive
-    payload += bytes([1])  # flag between ChildsRecursive and Parents. TIA
-    # sends 1 on the device tree explore and 0 on the event tree / pair
-    # explores; 1 is fine here since this always builds an attribute explore.
-    payload += bytes([0])  # ExploreParents
+    payload += bytes([explore_childs_recursive & 0xFF])
+    # Mid flag tracks WithIntegrityId in S7CommPlusDriver's ExploreRequest.
+    payload += bytes([1 if with_integrity else 0])
+    payload += bytes([explore_parents & 0xFF])
     payload += bytes([0])  # number of following filter objects (none)
     payload += encode_uint32_vlq(len(attribute_ids))  # AddressList count
     for attr_id in attribute_ids:
         payload += encode_uint32_vlq(attr_id)
-    # Trailer: UInt32 fill + a single filler byte. For V2+, send_request(integrity_tail=5)
-    # splices the IntegrityId in just before these 5 bytes.
-    payload += struct.pack(">I", 0) + bytes([0])
+    # Trailer: UInt32 fill; modern sessions add one filler byte so
+    # send_request(integrity_tail=5) can splice the IntegrityId before it.
+    payload += struct.pack(">I", 0)
+    if with_integrity:
+        payload += bytes([0])
     return bytes(payload)
 
 

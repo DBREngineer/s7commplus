@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import struct
 
+from s7commplus.client import _build_explore_request
 from s7commplus.metadata import (
     build_get_var_substreamed_payload,
+    explore_integrity_framing,
     parse_cpu_identification_blob,
     parse_get_var_substreamed_pvalue,
     parse_text_container_lcids,
@@ -26,6 +28,17 @@ def test_old_firmware_framing_only_on_plaintext_v1() -> None:
     assert uses_old_firmware_gvs_framing(_Conn(ProtocolVersion.V1, False))
     assert not uses_old_firmware_gvs_framing(_Conn(ProtocolVersion.V1, True))
     assert not uses_old_firmware_gvs_framing(_Conn(ProtocolVersion.V2, False))
+    assert explore_integrity_framing(_Conn(ProtocolVersion.V1, False)) == (False, 0)
+    assert explore_integrity_framing(_Conn(ProtocolVersion.V2, False)) == (True, 5)
+
+
+def test_explore_request_without_integrity_omits_filler_byte() -> None:
+    modern = _build_explore_request(3, [1], with_integrity=True)
+    legacy = _build_explore_request(3, [1], with_integrity=False)
+    assert modern.endswith(struct.pack(">I", 0) + bytes([0]))
+    assert legacy.endswith(struct.pack(">I", 0))
+    assert modern[6] == 1  # mid / WithIntegrityId (after ExploreId + RequestId VLQ + Recursive)
+    assert legacy[6] == 0
 
 
 def test_old_firmware_payload_has_fixed_key_qualifier_and_integrity() -> None:

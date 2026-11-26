@@ -47,19 +47,15 @@ class _AlarmClassConnection(Protocol):
     ) -> bytes: ...
 
 
-def build_alarm_classes_explore_payload() -> bytes:
+def build_alarm_classes_explore_payload(*, with_integrity: bool = True) -> bytes:
     """EXPLORE thePLCProgram asking only for Block_AlarmDescription."""
-    payload = bytearray()
-    payload += struct.pack(">I", Ids.NATIVE_THE_PLC_PROGRAM_RID)
-    payload += encode_uint32_vlq(0)
-    payload += bytes([1])  # ExploreChildsRecursive
-    payload += bytes([1])  # mid / WithIntegrityId
-    payload += bytes([0])  # ExploreParents
-    payload += bytes([0])  # no filter
-    payload += encode_uint32_vlq(1)
-    payload += encode_uint32_vlq(Ids.BLOCK_ALARM_DESCRIPTION)
-    payload += struct.pack(">I", 0) + bytes([0])
-    return bytes(payload)
+    from .client import _build_explore_request
+
+    return _build_explore_request(
+        Ids.NATIVE_THE_PLC_PROGRAM_RID,
+        [Ids.BLOCK_ALARM_DESCRIPTION],
+        with_integrity=with_integrity,
+    )
 
 
 def parse_alarm_class_list_xml(xml_data: bytes | str) -> list[AlarmClass]:
@@ -176,8 +172,13 @@ def parse_alarm_classes_from_explore(response: bytes) -> list[AlarmClass]:
 
 def read_alarm_classes(connection: _AlarmClassConnection) -> list[AlarmClass]:
     """EXPLORE program blocks for alarm-class engineering metadata."""
-    payload = build_alarm_classes_explore_payload()
-    response = connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+    from .metadata import explore_integrity_framing
+
+    with_integrity, integrity_tail = explore_integrity_framing(connection)  # type: ignore[arg-type]
+    payload = build_alarm_classes_explore_payload(with_integrity=with_integrity)
+    response = connection.send_request(
+        FunctionCode.EXPLORE, payload, integrity_tail=integrity_tail, reassemble=True
+    )
     return parse_alarm_classes_from_explore(response)
 
 

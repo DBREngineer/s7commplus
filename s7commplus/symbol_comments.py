@@ -83,22 +83,19 @@ class _CommentConnection(Protocol):
     ) -> bytes: ...
 
 
-def build_symbol_comments_explore_payload(relation_id: int) -> bytes:
+def build_symbol_comments_explore_payload(relation_id: int, *, with_integrity: bool = True) -> bytes:
     """EXPLORE payload for name + line comments + interface description."""
-    attrs = [
-        Ids.OBJECT_VARIABLE_TYPE_NAME,
-        Ids.DATA_INTERFACE_LINE_COMMENTS,
-        Ids.DATA_INTERFACE_INTERFACE_DESCRIPTION,
-    ]
-    payload = bytearray()
-    payload += struct.pack(">I", relation_id & 0xFFFFFFFF)
-    payload += encode_uint32_vlq(0)
-    payload += bytes([1, 1, 0, 0])
-    payload += encode_uint32_vlq(len(attrs))
-    for attr in attrs:
-        payload += encode_uint32_vlq(attr)
-    payload += struct.pack(">I", 0) + bytes([0])
-    return bytes(payload)
+    from .client import _build_explore_request
+
+    return _build_explore_request(
+        relation_id & 0xFFFFFFFF,
+        [
+            Ids.OBJECT_VARIABLE_TYPE_NAME,
+            Ids.DATA_INTERFACE_LINE_COMMENTS,
+            Ids.DATA_INTERFACE_INTERFACE_DESCRIPTION,
+        ],
+        with_integrity=with_integrity,
+    )
 
 
 def parse_symbol_comment_catalog(
@@ -193,8 +190,13 @@ def parse_symbol_comments_from_explore(response: bytes, relation_id: int) -> Sym
 
 def read_symbol_comments(connection: _CommentConnection, relation_id: int) -> SymbolCommentCatalog:
     """Read symbol comments for one DB / absolute-area relation ID."""
-    payload = build_symbol_comments_explore_payload(relation_id)
-    response = connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+    from .metadata import explore_integrity_framing
+
+    with_integrity, integrity_tail = explore_integrity_framing(connection)  # type: ignore[arg-type]
+    payload = build_symbol_comments_explore_payload(relation_id, with_integrity=with_integrity)
+    response = connection.send_request(
+        FunctionCode.EXPLORE, payload, integrity_tail=integrity_tail, reassemble=True
+    )
     return parse_symbol_comments_from_explore(response, relation_id)
 
 

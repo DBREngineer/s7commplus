@@ -806,13 +806,22 @@ class S7CommPlusAsyncClient(_ClientMethods):
             S7ReturnValueError: If the PLC answers with a non-zero ReturnValue, e.g. for an object that does not exist.
         """
         connection = self._require_connected()
+        from .metadata import uses_old_firmware_gvs_framing
+
         if connection._session_key is not None:
             explore_id = explore_id or 0x38
             payload = _build_explore_payload_v3(explore_id)
+            integrity_tail = 5
         else:
             explore_id = explore_id or Ids.NATIVE_THE_PLC_PROGRAM_RID
-            payload = _build_explore_request(explore_id, list(attributes or []))
-        response = await connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+            with_integrity = not uses_old_firmware_gvs_framing(connection)
+            payload = _build_explore_request(
+                explore_id, list(attributes or []), with_integrity=with_integrity
+            )
+            integrity_tail = 5 if with_integrity else 0
+        response = await connection.send_request(
+            FunctionCode.EXPLORE, payload, integrity_tail=integrity_tail, reassemble=True
+        )
         parse_or_raise_for_return_value(response, f"EXPLORE of 0x{explore_id:08X}")
         return response
 

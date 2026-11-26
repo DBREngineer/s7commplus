@@ -108,6 +108,17 @@ def uses_old_firmware_gvs_framing(connection: _MetadataConnection) -> bool:
     return version == ProtocolVersion.V1 and not connection.secured_session
 
 
+def explore_integrity_framing(connection: _MetadataConnection) -> tuple[bool, int]:
+    """``(with_integrity, integrity_tail)`` for EXPLORE on this session.
+
+    Plaintext FW2.2 rejects modern IntegrityId trailers (S7CommPlusDriver
+    ``ExploreRequest.WithIntegrityId = false``).
+    """
+    if uses_old_firmware_gvs_framing(connection):
+        return False, 0
+    return True, 5
+
+
 def build_get_var_substreamed_payload(
     object_id: int,
     address: int,
@@ -419,19 +430,17 @@ def parse_text_container_lcids(response: bytes) -> CpuCultureInfo:
     return CpuCultureInfo(language_ids=())
 
 
-def build_text_container_explore_payload() -> bytes:
+def build_text_container_explore_payload(*, with_integrity: bool = True) -> bytes:
     """EXPLORE payload for theTextContainer asking only for LCIDs."""
-    payload = bytearray()
-    payload += struct.pack(">I", Ids.NATIVE_THE_TEXT_CONTAINER_RID)
-    payload += encode_uint32_vlq(0)  # ExploreRequestId
-    payload += bytes([0])  # ExploreChildsRecursive
-    payload += bytes([1])  # mid flag
-    payload += bytes([1])  # ExploreParents (match S7CommPlusDriver)
-    payload += bytes([0])  # no filter objects
-    payload += encode_uint32_vlq(1)
-    payload += encode_uint32_vlq(Ids.TEXT_CONTAINER_LCIDS)
-    payload += struct.pack(">I", 0) + bytes([0])
-    return bytes(payload)
+    from .client import _build_explore_request
+
+    return _build_explore_request(
+        Ids.NATIVE_THE_TEXT_CONTAINER_RID,
+        [Ids.TEXT_CONTAINER_LCIDS],
+        explore_childs_recursive=0,
+        explore_parents=1,
+        with_integrity=with_integrity,
+    )
 
 
 def read_cpu_culture_info(connection: _MetadataConnection) -> CpuCultureInfo:
@@ -443,8 +452,11 @@ def read_cpu_culture_info(connection: _MetadataConnection) -> CpuCultureInfo:
     from .codec import parse_or_raise_for_return_value
     from .error import S7ReturnValueError
 
-    payload = build_text_container_explore_payload()
-    response = connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+    with_integrity, integrity_tail = explore_integrity_framing(connection)
+    payload = build_text_container_explore_payload(with_integrity=with_integrity)
+    response = connection.send_request(
+        FunctionCode.EXPLORE, payload, integrity_tail=integrity_tail, reassemble=True
+    )
     try:
         parse_or_raise_for_return_value(response, "CPU culture info")
     except S7ReturnValueError:

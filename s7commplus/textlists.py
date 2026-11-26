@@ -171,18 +171,17 @@ def decode_text_list_library(
     return lists
 
 
-def build_text_list_explore_payload(relation_id: int) -> bytes:
+def build_text_list_explore_payload(relation_id: int, *, with_integrity: bool = True) -> bytes:
     """EXPLORE payload for one text-list library relation (no attribute filter)."""
-    payload = bytearray()
-    payload += struct.pack(">I", relation_id & 0xFFFFFFFF)
-    payload += encode_uint32_vlq(0)  # ExploreRequestId
-    payload += bytes([0])  # ExploreChildsRecursive
-    payload += bytes([1])  # mid / WithIntegrityId
-    payload += bytes([0])  # ExploreParents
-    payload += bytes([0])  # no filter objects
-    payload += encode_uint32_vlq(0)  # empty AddressList → all attributes
-    payload += struct.pack(">I", 0) + bytes([0])
-    return bytes(payload)
+    from .client import _build_explore_request
+
+    return _build_explore_request(
+        relation_id & 0xFFFFFFFF,
+        [],
+        explore_childs_recursive=0,
+        explore_parents=0,
+        with_integrity=with_integrity,
+    )
 
 
 def parse_text_library_explore(response: bytes) -> Optional[tuple[list[bytes], bytes]]:
@@ -256,8 +255,13 @@ def _append_library(
     scope: TextListScope,
     lists: list[TextList],
 ) -> None:
-    payload = build_text_list_explore_payload(relation_id)
-    response = connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+    from .metadata import explore_integrity_framing
+
+    with_integrity, integrity_tail = explore_integrity_framing(connection)  # type: ignore[arg-type]
+    payload = build_text_list_explore_payload(relation_id, with_integrity=with_integrity)
+    response = connection.send_request(
+        FunctionCode.EXPLORE, payload, integrity_tail=integrity_tail, reassemble=True
+    )
     parsed = parse_text_library_explore(response)
     if parsed is None:
         return
