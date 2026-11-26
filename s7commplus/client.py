@@ -1872,6 +1872,12 @@ class S7CommPlusClient(_ClientMethods):
 
         return read_symbol_comments(self._require_connected(), relation_id)
 
+    def symbol_browser(self):
+        """Return a lazy hierarchical :class:`~s7commplus.SymbolBrowser` for this client."""
+        from .symbol_browser import SymbolBrowser
+
+        return SymbolBrowser(self)
+
     def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 

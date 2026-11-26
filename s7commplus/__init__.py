@@ -18,6 +18,7 @@ from .async_client import S7CommPlusAsyncClient as AsyncClient
 from .alarm import Alarm, AlarmNotification, AlarmText, LanguageId, format_alarm_text
 from .alarm_classes import AlarmClass
 from .symbol_comments import SymbolCommentCatalog
+from .symbol_browser import BrowseNode, SymbolBrowser
 from .blob_decompressor import (
     PresetStream,
     decompress_blob,
@@ -75,6 +76,7 @@ __all__ = [
     "AsyncSubscriptionQueue",
     "BlockInterface",
     "BlockInterfaceError",
+    "BrowseNode",
     "CPUState",
     "Client",
     "CpuCultureInfo",
@@ -113,6 +115,7 @@ __all__ = [
     "SubscriptionNotification",
     "SubscriptionRestoreResult",
     "SubscriptionDiagnostics",
+    "SymbolBrowser",
     "SymbolCatalog",
     "SymbolCommentCatalog",
     "SymbolicReadItem",
