@@ -45,6 +45,7 @@ from .error import (
     S7SubscriptionError,
     S7TimeoutError,
     S7TlsHandshakeError,
+    S7WriteDisabledError,
     S7WriteError,
 )
 from .object_model import attribute_name, describe_attribute
@@ -101,6 +102,7 @@ __all__ = [
     "S7SubscriptionError",
     "S7TimeoutError",
     "S7TlsHandshakeError",
+    "S7WriteDisabledError",
     "S7WriteError",
     "Server",
     "SubscriptionItem",

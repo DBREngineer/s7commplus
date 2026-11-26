@@ -141,6 +141,14 @@ class S7WriteError(S7Error, RuntimeError):
         self.not_sent: range = not_sent if not_sent is not None else range(0)
 
 
+class S7WriteDisabledError(S7WriteError):
+    """Raised when a write runs while ``write_enabled`` is false.
+
+    Matches S7CommPlusDriver's write-safety gate: PLC-mutating calls stay
+    blocked until the caller sets ``client.write_enabled = True``.
+    """
+
+
 class S7RequestError(S7Error, RuntimeError):
     """The PLC refused a request, or its reply did not answer every item asked for.
 

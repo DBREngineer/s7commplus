@@ -14,6 +14,22 @@ from tests.real_plc.support import PASSWORD_ENV
 _REAL_PLC_REPORT = RealPLCReport()
 
 
+@pytest.fixture(autouse=True)
+def _enable_writes_by_default(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Keep existing write tests working after WriteEnabled defaults to false.
+
+    Production clients must set ``write_enabled = True`` explicitly. Tests that
+    assert the safety gate should mark themselves ``write_gate``.
+    """
+    if request.node.get_closest_marker("write_gate"):
+        return
+    from s7commplus.async_client import S7CommPlusAsyncClient
+    from s7commplus.client import S7CommPlusClient
+
+    monkeypatch.setattr(S7CommPlusClient, "write_enabled", True, raising=False)
+    monkeypatch.setattr(S7CommPlusAsyncClient, "write_enabled", True, raising=False)
+
+
 def get_free_tcp_port() -> int:
     """Return a TCP port that ``S7CommPlusServer.start()`` can bind *right now*.
 

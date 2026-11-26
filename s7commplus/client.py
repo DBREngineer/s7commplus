@@ -23,6 +23,7 @@ from .error import (
     S7SubscriptionError,
     S7TimeoutError,
     S7TlsHandshakeError,
+    S7WriteDisabledError,
     S7WriteError,
 )
 
@@ -604,8 +605,17 @@ class _ClientMethods:
     _generation: int
     _subscriptions: SubscriptionRegistry
     _auto_reconnect: bool
+    write_enabled: bool
     max_items_per_request: int
     max_request_bytes: int
+
+    def _require_write_enabled(self) -> None:
+        """Refuse PLC-mutating calls until ``write_enabled`` is set."""
+        if not self.write_enabled:
+            raise S7WriteDisabledError(
+                "Writes are disabled; set client.write_enabled = True to allow PLC writes "
+                "(matches S7CommPlusDriver's WriteEnabled safety gate)"
+            )
 
     def _frame_overhead(self) -> int:
         raise NotImplementedError
@@ -655,6 +665,10 @@ class S7CommPlusClient(_ClientMethods):
     Use ``from s7commplus import Client`` to instantiate.
 
     Attributes:
+        write_enabled: When false (the default), PLC-mutating calls raise
+            :class:`~s7commplus.error.S7WriteDisabledError` before sending.
+            Set to ``True`` to allow writes, matching S7CommPlusDriver's
+            ``WriteEnabled`` safety gate.
         max_items_per_request: Most items one multi-item read or write request
             carries (default 50; ``0`` sends a batch in one request). A larger
             batch is split over several requests, in order. A CPU 1215C FW V4.2
@@ -669,6 +683,8 @@ class S7CommPlusClient(_ClientMethods):
             is split; an item too large for one request raises ``ValueError``
             before anything is sent.
     """
+
+    write_enabled = False
 
     def __init__(self) -> None:
         self._connection: Optional[S7CommPlusConnection] = None
@@ -1200,6 +1216,7 @@ class S7CommPlusClient(_ClientMethods):
                 a generic replacement for scalar datatypes.
 
         Raises:
+            S7WriteDisabledError: When :attr:`write_enabled` is false.
             S7WriteError: After the last request, if the PLC refused any item;
                 ``item_errors`` is keyed by position in ``items``. Also when a
                 connection, timeout or protocol failure interrupts a split batch
@@ -1210,6 +1227,7 @@ class S7CommPlusClient(_ClientMethods):
             ValueError: An item is too large for one request on its own;
                 nothing is sent.
         """
+        self._require_write_enabled()
         connection = self._require_connected()
 
         def build_write(chunk: list[DBWriteItem]) -> bytes:
@@ -1296,6 +1314,7 @@ class S7CommPlusClient(_ClientMethods):
             datatype: Target PLC datatype. BLOB preserves legacy raw-byte calls;
                 use an explicit scalar datatype when writing a scalar target.
         """
+        self._require_write_enabled()
         connection = self._require_connected()
 
         payload = _build_area_write_payload(area_rid, start, data, connection.object_qualifier_version, datatype=datatype)
@@ -1405,6 +1424,7 @@ class S7CommPlusClient(_ClientMethods):
             datatype: Target PLC datatype, as reported by browse(). BLOB preserves
                 legacy calls but is not a generic replacement for scalar types.
         """
+        self._require_write_enabled()
         connection = self._require_connected()
 
         payload = _build_symbolic_write_payload(
@@ -1591,9 +1611,11 @@ class S7CommPlusClient(_ClientMethods):
         before writing after a possible download.
 
         Raises:
+            S7WriteDisabledError: When :attr:`write_enabled` is false.
             ValueError: A value is too large for one request on its own;
                 nothing is sent.
         """
+        self._require_write_enabled()
         self._require_connected()
         if not values:
             return []
@@ -1842,8 +1864,10 @@ class S7CommPlusClient(_ClientMethods):
             An :class:`OperatingStateChange` with the sent and received bytes.
 
         Raises:
+            S7WriteDisabledError: When :attr:`write_enabled` is false.
             S7NotConnectedError: If the client is not connected (also a ``RuntimeError``).
         """
+        self._require_write_enabled()
         connection = self._require_connected()
         payload = _build_set_operating_state_payload(Ids.NATIVE_THE_CPU_EXEC_UNIT_RID, int(state))
         response = connection.send_request(FunctionCode.SET_VARIABLE, payload, integrity_tail=4)

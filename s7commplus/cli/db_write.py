@@ -29,6 +29,7 @@ def register(subparsers: Subparsers) -> None:
 def run(args: argparse.Namespace) -> int:
     """Write the bytes and echo the range written."""
     with open_client(args) as client:
+        client.write_enabled = True
         client.db_write(args.db, args.start, args.hex_value)
     print(f"DB{args.db}[{args.start}:{args.start + len(args.hex_value)}] = {args.hex_value.hex()}")
     return EXIT_OK

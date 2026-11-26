@@ -57,6 +57,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         data = args.string_value.encode("utf-8")
     with open_client(args) as client:
+        client.write_enabled = True
         client.write_tag(args.name, data)
     print(f"{args.name} = {data.hex()}")
     return EXIT_OK

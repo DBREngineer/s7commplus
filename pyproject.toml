@@ -79,6 +79,7 @@ markers = [
     "tls: real-PLC scenario that needs --plc-use-tls",
     "password: real-PLC scenario that needs the S7COMMPLUS_TEST_PASSWORD environment variable",
     "pending: real-PLC scenario for an API from an open pull request; skipped until it is merged",
+    "write_gate: asserts the WriteEnabled safety gate (writes stay disabled)",
 ]
 
 [tool.mypy]
