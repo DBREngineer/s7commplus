@@ -1048,6 +1048,22 @@ class S7CommPlusAsyncClient(_ClientMethods):
         response = await connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
         return parse_alarm_classes_from_explore(response)
 
+    @_retry_on_dropped_connection
+    async def get_symbol_comments(self, relation_id: int):
+        """Read engineering comments for one DB or absolute-area relation.
+
+        Matches S7CommPlusDriver ``GetSymbolCommentsAsync``.
+        """
+        from .symbol_comments import (
+            build_symbol_comments_explore_payload,
+            parse_symbol_comments_from_explore,
+        )
+
+        connection = self._require_connected()
+        payload = build_symbol_comments_explore_payload(relation_id)
+        response = await connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+        return parse_symbol_comments_from_explore(response, relation_id)
+
     async def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 

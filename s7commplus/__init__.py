@@ -17,6 +17,7 @@ from .async_client import AsyncSubscriptionQueue
 from .async_client import S7CommPlusAsyncClient as AsyncClient
 from .alarm import Alarm, AlarmNotification, AlarmText, LanguageId, format_alarm_text
 from .alarm_classes import AlarmClass
+from .symbol_comments import SymbolCommentCatalog
 from .blob_decompressor import (
     PresetStream,
     decompress_blob,
@@ -113,6 +114,7 @@ __all__ = [
     "SubscriptionRestoreResult",
     "SubscriptionDiagnostics",
     "SymbolCatalog",
+    "SymbolCommentCatalog",
     "SymbolicReadItem",
     "SymbolicTag",
     "Tag",

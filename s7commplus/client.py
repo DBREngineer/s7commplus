@@ -1862,6 +1862,16 @@ class S7CommPlusClient(_ClientMethods):
 
         return read_alarm_classes(self._require_connected())
 
+    @_retry_on_dropped_connection
+    def get_symbol_comments(self, relation_id: int):
+        """Read engineering comments for one DB or absolute-area relation.
+
+        Matches S7CommPlusDriver ``GetSymbolCommentsAsync``.
+        """
+        from .symbol_comments import read_symbol_comments
+
+        return read_symbol_comments(self._require_connected(), relation_id)
+
     def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 
