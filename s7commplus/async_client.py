@@ -1032,6 +1032,22 @@ class S7CommPlusAsyncClient(_ClientMethods):
             )
         return TextListCatalog(tuple(requested), tuple(lists))
 
+    @_retry_on_dropped_connection
+    async def get_alarm_classes(self):
+        """Read configured alarm classes from block engineering metadata.
+
+        Matches S7CommPlusDriver ``GetAlarmClassesAsync`` (EXPLORE AID 7853).
+        """
+        from .alarm_classes import (
+            build_alarm_classes_explore_payload,
+            parse_alarm_classes_from_explore,
+        )
+
+        connection = self._require_connected()
+        payload = build_alarm_classes_explore_payload()
+        response = await connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+        return parse_alarm_classes_from_explore(response)
+
     async def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 

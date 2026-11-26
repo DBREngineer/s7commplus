@@ -329,6 +329,8 @@ class Ids(IntEnum):
     VARIABLE_TYPE_STRUCT_MODIFICATION_TIME = 529
     DATA_INTERFACE_INTERFACE_DESCRIPTION = 2544
     DATA_INTERFACE_LINE_COMMENTS = 2546
+    # Block engineering metadata with AlarmClassList XML (GetAlarmClasses).
+    BLOCK_ALARM_DESCRIPTION = 7853
     AS_OBJECT_ES_COMMENT = 4288
     # Cycle-load values (see object_model.py); 1/7 in a hardware RUN capture and
     # 0/0 in STOP, but 0/8 and 0/10 in RUN on PLCSIM Advanced, so they are only a

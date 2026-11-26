@@ -16,6 +16,7 @@ Usage::
 from .async_client import AsyncSubscriptionQueue
 from .async_client import S7CommPlusAsyncClient as AsyncClient
 from .alarm import Alarm, AlarmNotification, AlarmText, LanguageId, format_alarm_text
+from .alarm_classes import AlarmClass
 from .blob_decompressor import (
     PresetStream,
     decompress_blob,
@@ -65,6 +66,7 @@ from .zlib_dicts import PresetIdentity
 
 __all__ = [
     "Alarm",
+    "AlarmClass",
     "AlarmNotification",
     "AlarmText",
     "ArrayDimension",

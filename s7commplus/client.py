@@ -1852,6 +1852,16 @@ class S7CommPlusClient(_ClientMethods):
             culture_ids = self.get_cpu_culture_info().language_ids
         return read_text_lists(connection, language_ids, culture_language_ids=culture_ids)
 
+    @_retry_on_dropped_connection
+    def get_alarm_classes(self):
+        """Read configured alarm classes from block engineering metadata.
+
+        Matches S7CommPlusDriver ``GetAlarmClassesAsync`` (EXPLORE AID 7853).
+        """
+        from .alarm_classes import read_alarm_classes
+
+        return read_alarm_classes(self._require_connected())
+
     def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 
