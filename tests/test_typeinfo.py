@@ -307,6 +307,34 @@ def _obj_header(relid: int, class_id: int) -> bytes:
     return bytes([0xA1]) + struct.pack(">I", relid) + encode_uint32_vlq(class_id) + encode_uint32_vlq(0) + encode_uint32_vlq(0)
 
 
+def _tag_description(
+    *,
+    offset_info_type: int,
+    name: str,
+    datatype: int,
+    soft_datatype: int,
+    lid: int,
+    trailer: bytes,
+    attribute_flags: int = 0,
+    type_specific: int = 0,
+    unknown2: int = 0x10,
+) -> bytes:
+    """Build one FW2.x TagDescription (0xA7..0xA8) for parser tests."""
+    name_bytes = name.encode("utf-8")
+    return (
+        bytes([0xA7, offset_info_type])
+        + encode_uint32_vlq(len(name_bytes))
+        + name_bytes
+        + bytes([unknown2, datatype])
+        + encode_uint32_vlq(soft_datatype)
+        + struct.pack(">I", attribute_flags)
+        + encode_uint32_vlq(lid)
+        + encode_uint32_vlq(type_specific)
+        + trailer
+        + bytes([0xA8])
+    )
+
+
 class TestParseObject:
     def test_header_attribute_vartype_varname(self) -> None:
         el = _element(10, 0, int(ti.Softdatatype.INT), 0x8000, 0, struct.pack("<HH", 2, 4))
@@ -339,6 +367,68 @@ class TestParseObject:
         objs, off = ti.parse_object_list(a + b, 0)
         assert [o.relation_id for o in objs] == [1, 2]
         assert off == len(a + b)
+
+    def test_fw22_tag_description_plain_and_bool(self) -> None:
+        # Layout from S7-1212C FW V2.2 (192.168.6.31): Plain LREAL + Bool members.
+        plain = _tag_description(
+            offset_info_type=0x04,
+            name="in_rSollwert",
+            datatype=0x0F,
+            soft_datatype=int(ti.Softdatatype.LREAL),
+            lid=0x31,
+            trailer=bytes([0x00, 0x01, 0x00, 0x08]),
+        )
+        boolean = _tag_description(
+            offset_info_type=0x05,
+            name="in_xManualEnable",
+            datatype=0x01,
+            soft_datatype=int(ti.Softdatatype.BOOL),
+            lid=0x11,
+            trailer=bytes([0x00, 0x01, 0x08, 0x81, 0x00, 0x00, 0x00]),
+        )
+        body = _obj_header(0x92000003, 511) + plain + boolean + bytes([0xA2])
+        obj, off = ti.parse_object(body, 0)
+        assert off == len(body)
+        assert obj.varname_list == ["in_rSollwert", "in_xManualEnable"]
+        assert [e.lid for e in obj.vartype_list] == [0x31, 0x11]
+        assert obj.vartype_list[0].softdatatype == int(ti.Softdatatype.LREAL)
+        assert obj.vartype_list[0].offset_info.opt_addr == 0
+        assert obj.vartype_list[0].offset_info.nonopt_addr == 8
+        assert obj.vartype_list[1].softdatatype == int(ti.Softdatatype.BOOL)
+        assert obj.vartype_list[1].offset_info.opt_addr == 8
+
+    def test_fw22_tag_description_struct_relation(self) -> None:
+        # Plain struct with RelationId in typeSpecific (int_fbTON on FW V2.2).
+        struct = _tag_description(
+            offset_info_type=0x04,
+            name="int_fbTON",
+            datatype=int(DataType.STRUCT),
+            soft_datatype=31,
+            lid=0x13,
+            type_specific=33_554_463,
+            trailer=bytes([0x00, 0x04, 0x00, 0x04]),
+        )
+        body = _obj_header(0x93000001, 511) + struct + bytes([0xA2])
+        obj, off = ti.parse_object(body, 0)
+        assert off == len(body)
+        assert obj.varname_list == ["int_fbTON"]
+        el = obj.vartype_list[0]
+        assert el.offset_info.has_relation
+        assert el.offset_info.relation_id == 33_554_463
+        assert el.offset_info.opt_addr == 0
+        assert el.offset_info.nonopt_addr == 4
+
+    def test_fw22_relation_element(self) -> None:
+        body = (
+            _obj_header(0x93000001, 511)
+            + bytes([0xA4])
+            + encode_uint32_vlq(1)
+            + struct.pack(">I", 0x12345678)
+            + bytes([0xA2])
+        )
+        obj, off = ti.parse_object(body, 0)
+        assert off == len(body)
+        assert obj.relations == {1: 0x12345678}
 
 
 def _vte(

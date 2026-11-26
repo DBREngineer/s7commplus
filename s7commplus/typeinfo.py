@@ -5,6 +5,12 @@ and flattens it into a list of readable tags. The structures below follow the
 S7CommPlus wire protocol (PVartypeList, POffsetInfoType, the PObject tree and the
 VarnameList) as observed on an S7-1500 and documented publicly.
 
+Older S7-1200 firmware (for example FW V2.2) ships the same container with
+per-member TagDescription elements (0xA7..0xA8) instead of packed VartypeList /
+VarnameList blocks. Those are decoded into the same :class:`VartypeListElement`
+shape so :func:`build_tree` can reuse the modern path. The layout follows
+``PTagDescription`` in S7CommPlusDriver (LGPL-3.0).
+
 The end product is a flat list of :class:`VarInfo` records, each carrying the
 symbolic name, the access sequence (used to address the tag), the software
 datatype and the optimized / non-optimized byte (and bit) offsets.
@@ -16,15 +22,18 @@ import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
 
-from .codec import decode_pvalue_to_bytes
+from .codec import decode_pvalue_to_bytes, decode_wstring
 from .protocol import DataType  # noqa: F401  (re-exported convenience for callers)
-from .vlq import decode_uint32_vlq
+from .vlq import decode_int32_vlq, decode_uint32_vlq
 
 # -- Element ID tags in the PObject stream --
 
 START_OF_OBJECT = 0xA1
 TERMINATING_OBJECT = 0xA2
 ATTRIBUTE = 0xA3
+RELATION = 0xA4
+START_OF_TAG_DESCRIPTION = 0xA7
+TERMINATING_TAG_DESCRIPTION = 0xA8
 VARTYPE_LIST = 0xAB
 VARNAME_LIST = 0xAC
 
@@ -534,8 +543,343 @@ def parse_vartype_list(data: bytes, offset: int) -> tuple[list[VartypeListElemen
 
 
 # ---------------------------------------------------------------------------
-# 5/6. PObject tree & VarnameList
+# 5. Legacy TagDescription (S7-1200 FW2.x) & VarnameList
 # ---------------------------------------------------------------------------
+
+# Wireshark S7COMMP_TAGDESCR_OFFSETINFOTYPE_* (wire byte after 0xA7).
+_TAGDESCR_LIB_ELEMENT = 0x00
+_TAGDESCR_BOOL_IN_UDT = 0x01
+_TAGDESCR_ARRAY_IN_STRUCT = 0x02
+_TAGDESCR_PLAIN_STATIC = 0x04
+_TAGDESCR_BOOL = 0x05
+_TAGDESCR_ARRAY = 0x06
+_TAGDESCR_MULTIDIM_ARRAY = 0x07
+
+_TAGDESCR_ATTR_HMI_VISIBLE = 0x0800000
+_TAGDESCR_ATTR_HMI_READONLY = 0x0400000
+_TAGDESCR_ATTR_HMI_ACCESSIBLE = 0x0100000
+_TAGDESCR_ATTR_RETAIN = 0x2000000
+_TAGDESCR_ATTR_CLASSIC = 0x1000000
+
+# Modern POffsetInfoType selectors packed into AttributeFlags bits 12..15.
+_OI_STD = 8
+_OI_STRING = 9
+_OI_ARRAY1 = 10
+_OI_ARRAYM = 11
+_OI_STRUCT = 12
+_OI_STRUCT1 = 13
+_OI_STRUCTM = 14
+_OI_FBSFB = 15
+
+
+def _tagdescr_map_attribute_flags(wire_flags: int, offset_info_type: int) -> int:
+    """Pack FW2.x visibility bits and a synthetic modern offsetinfotype."""
+    flags = 0
+    if wire_flags & _TAGDESCR_ATTR_HMI_VISIBLE:
+        flags |= 0x0800
+    if wire_flags & _TAGDESCR_ATTR_HMI_READONLY:
+        flags |= 0x0400
+    if wire_flags & _TAGDESCR_ATTR_HMI_ACCESSIBLE:
+        flags |= 0x0200
+    modern = {
+        _TAGDESCR_PLAIN_STATIC: _OI_STD,
+        _TAGDESCR_BOOL: _OI_STD,
+        _TAGDESCR_ARRAY: _OI_ARRAY1,
+        _TAGDESCR_MULTIDIM_ARRAY: _OI_ARRAYM,
+        _TAGDESCR_LIB_ELEMENT: _OI_FBSFB,
+    }.get(offset_info_type, _OI_STD)
+    return (flags & 0x0FFF) | (modern << 12)
+
+
+def _tagdescr_map_bitoffset_flags(wire_flags: int) -> int:
+    flags = 0
+    if wire_flags & _TAGDESCR_ATTR_RETAIN:
+        flags |= 0x80
+    if wire_flags & _TAGDESCR_ATTR_CLASSIC:
+        flags |= 0x08
+    return flags
+
+
+def _decode_vlq_u32(data: bytes, offset: int) -> tuple[int, int]:
+    value, consumed = decode_uint32_vlq(data, offset)
+    return value, offset + consumed
+
+
+def _decode_vlq_i32(data: bytes, offset: int) -> tuple[int, int]:
+    value, consumed = decode_int32_vlq(data, offset)
+    return value, offset + consumed
+
+
+def _tagdescr_offset_info(
+    data: bytes,
+    offset: int,
+    offset_info_type: int,
+    datatype: int,
+    type_specific: int,
+) -> tuple[OffsetInfo, int]:
+    """Decode the FW2.x offset-info trailer after the common TagDescription header."""
+    if offset_info_type == _TAGDESCR_LIB_ELEMENT:
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        return (
+            OffsetInfo(code=_OI_FBSFB, opt_addr=o1, nonopt_addr=o2, relation_id=type_specific, has_relation=True),
+            offset,
+        )
+
+    if offset_info_type == _TAGDESCR_BOOL_IN_UDT:
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        _, offset = _decode_vlq_u32(data, offset)  # bit offset type1
+        _, offset = _decode_vlq_u32(data, offset)  # bit offset type2
+        return OffsetInfo(code=_OI_STD, opt_addr=o1, nonopt_addr=o2), offset
+
+    if offset_info_type == _TAGDESCR_ARRAY_IN_STRUCT:
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        lower, offset = _decode_vlq_i32(data, offset)
+        count, offset = _decode_vlq_u32(data, offset)
+        pad1, offset = _decode_vlq_u32(data, offset)
+        pad2, offset = _decode_vlq_u32(data, offset)
+        if datatype == DataType.STRUCT:
+            return (
+                OffsetInfo(
+                    code=_OI_STRUCT1,
+                    opt_addr=o1,
+                    nonopt_addr=o2,
+                    array_lower_bound=lower,
+                    array_element_count=count,
+                    unspecified1=min(pad1, 0xFFFF),
+                    unspecified2=min(pad2, 0xFFFF),
+                    relation_id=type_specific,
+                    has_relation=True,
+                    is_1dim=True,
+                ),
+                offset,
+            )
+        return (
+            OffsetInfo(
+                code=_OI_ARRAY1,
+                opt_addr=o1,
+                nonopt_addr=o2,
+                array_lower_bound=lower,
+                array_element_count=count,
+                unspecified1=min(pad1, 0xFFFF),
+                unspecified2=min(pad2, 0xFFFF),
+                is_1dim=True,
+            ),
+            offset,
+        )
+
+    if offset_info_type == _TAGDESCR_PLAIN_STATIC:
+        _, offset = _decode_vlq_u32(data, offset)  # accessability
+        _, offset = _decode_vlq_u32(data, offset)  # section
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        if datatype == DataType.STRUCT:
+            return (
+                OffsetInfo(
+                    code=_OI_STRUCT,
+                    opt_addr=o1,
+                    nonopt_addr=o2,
+                    relation_id=type_specific,
+                    has_relation=True,
+                ),
+                offset,
+            )
+        if datatype in (DataType.S7STRING, DataType.WSTRING):
+            return (
+                OffsetInfo(
+                    code=_OI_STRING,
+                    opt_addr=o1,
+                    nonopt_addr=o2,
+                    unspecified1=min(type_specific, 0xFFFF),
+                    unspecified2=min(type_specific + 2, 0xFFFF),
+                ),
+                offset,
+            )
+        return OffsetInfo(code=_OI_STD, opt_addr=o1, nonopt_addr=o2), offset
+
+    if offset_info_type == _TAGDESCR_BOOL:
+        _, offset = _decode_vlq_u32(data, offset)  # accessability
+        _, offset = _decode_vlq_u32(data, offset)  # section
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        _, offset = _decode_vlq_u32(data, offset)  # bit offset type1
+        _, offset = _decode_vlq_u32(data, offset)  # bit offset type2
+        return OffsetInfo(code=_OI_STD, opt_addr=o1, nonopt_addr=o2), offset
+
+    if offset_info_type == _TAGDESCR_ARRAY:
+        _, offset = _decode_vlq_u32(data, offset)  # accessability
+        _, offset = _decode_vlq_u32(data, offset)  # section
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        lower, offset = _decode_vlq_i32(data, offset)
+        count, offset = _decode_vlq_u32(data, offset)
+        pad1, offset = _decode_vlq_u32(data, offset)
+        pad2, offset = _decode_vlq_u32(data, offset)
+        if datatype == DataType.STRUCT:
+            return (
+                OffsetInfo(
+                    code=_OI_STRUCT1,
+                    opt_addr=o1,
+                    nonopt_addr=o2,
+                    array_lower_bound=lower,
+                    array_element_count=count,
+                    unspecified1=min(pad1, 0xFFFF),
+                    unspecified2=min(pad2, 0xFFFF),
+                    relation_id=type_specific,
+                    has_relation=True,
+                    is_1dim=True,
+                ),
+                offset,
+            )
+        if datatype in (DataType.S7STRING, DataType.WSTRING):
+            return (
+                OffsetInfo(
+                    code=_OI_ARRAY1,
+                    opt_addr=o1,
+                    nonopt_addr=o2,
+                    array_lower_bound=lower,
+                    array_element_count=count,
+                    unspecified1=min(type_specific, 0xFFFF),
+                    unspecified2=min(pad2, 0xFFFF),
+                    is_1dim=True,
+                ),
+                offset,
+            )
+        return (
+            OffsetInfo(
+                code=_OI_ARRAY1,
+                opt_addr=o1,
+                nonopt_addr=o2,
+                array_lower_bound=lower,
+                array_element_count=count,
+                unspecified1=min(pad1, 0xFFFF),
+                unspecified2=min(pad2, 0xFFFF),
+                is_1dim=True,
+            ),
+            offset,
+        )
+
+    if offset_info_type == _TAGDESCR_MULTIDIM_ARRAY:
+        _, offset = _decode_vlq_u32(data, offset)  # accessability
+        _, offset = _decode_vlq_u32(data, offset)  # section
+        o1, offset = _decode_vlq_u32(data, offset)
+        o2, offset = _decode_vlq_u32(data, offset)
+        pad1, offset = _decode_vlq_u32(data, offset)
+        pad2, offset = _decode_vlq_u32(data, offset)
+        dimensions, offset = _decode_vlq_u32(data, offset)
+        lower_bounds = [0] * 6
+        element_counts = [0] * 6
+        total = 1
+        for d in range(min(dimensions, 6)):
+            lower_bounds[d], offset = _decode_vlq_i32(data, offset)
+            element_counts[d], offset = _decode_vlq_u32(data, offset)
+            total *= max(1, element_counts[d])
+        if datatype == DataType.STRUCT:
+            return (
+                OffsetInfo(
+                    code=_OI_STRUCTM,
+                    opt_addr=o1,
+                    nonopt_addr=o2,
+                    unspecified1=min(pad1, 0xFFFF),
+                    unspecified2=min(pad2, 0xFFFF),
+                    array_lower_bound=lower_bounds[0] if dimensions else 0,
+                    array_element_count=total,
+                    mdim_lower_bounds=lower_bounds,
+                    mdim_element_count=element_counts,
+                    relation_id=type_specific,
+                    has_relation=True,
+                    is_mdim=True,
+                ),
+                offset,
+            )
+        return (
+            OffsetInfo(
+                code=_OI_ARRAYM,
+                opt_addr=o1,
+                nonopt_addr=o2,
+                unspecified1=min(pad1, 0xFFFF),
+                unspecified2=min(pad2, 0xFFFF),
+                array_lower_bound=lower_bounds[0] if dimensions else 0,
+                array_element_count=total,
+                mdim_lower_bounds=lower_bounds,
+                mdim_element_count=element_counts,
+                is_mdim=True,
+            ),
+            offset,
+        )
+
+    # Unknown offset-info: skip VLQs until TerminatingTagDescription (Wireshark fallback).
+    while offset < len(data):
+        if data[offset] == TERMINATING_TAG_DESCRIPTION:
+            break
+        try:
+            _, offset = _decode_vlq_u32(data, offset)
+        except ValueError:
+            offset += 1
+            break
+    return OffsetInfo(code=_OI_STD), offset
+
+
+def parse_tag_description(data: bytes, offset: int) -> tuple[str, VartypeListElement, int]:
+    """Parse one legacy FW2.x TagDescription (0xA7..0xA8) into name + vartype element.
+
+    The caller has already consumed the leading 0xA7. The trailing 0xA8 is
+    consumed here when present so :func:`parse_object` can treat the pair as one
+    element.
+    """
+    if offset >= len(data):
+        raise ValueError("Truncated TagDescription")
+    offset_info_type = data[offset]
+    offset += 1
+    name_len, offset = _decode_vlq_u32(data, offset)
+    if offset + name_len > len(data):
+        raise ValueError("Truncated TagDescription name")
+    name, consumed = decode_wstring(data, offset, name_len)
+    offset += consumed
+    if offset + 2 > len(data):
+        raise ValueError("Truncated TagDescription header")
+    offset += 1  # unknown2
+    datatype = data[offset]
+    offset += 1
+    soft_datatype, offset = _decode_vlq_u32(data, offset)
+    if offset + 4 > len(data):
+        raise ValueError("Truncated TagDescription attribute flags")
+    (attribute_flags_wire,) = struct.unpack_from(">I", data, offset)
+    offset += 4
+    lid, offset = _decode_vlq_u32(data, offset)
+    type_specific, offset = _decode_vlq_u32(data, offset)
+    offset_info, offset = _tagdescr_offset_info(data, offset, offset_info_type, datatype, type_specific)
+
+    # Struct / FB members keep the relation even when AttributeFlags still say Std.
+    if offset_info.has_relation:
+        if offset_info.is_mdim:
+            attr_type = _OI_STRUCTM
+        elif offset_info.is_1dim:
+            attr_type = _OI_STRUCT1
+        elif offset_info.code == _OI_FBSFB:
+            attr_type = _OI_FBSFB
+        else:
+            attr_type = _OI_STRUCT
+        attribute_flags = (_tagdescr_map_attribute_flags(attribute_flags_wire, offset_info_type) & 0x0FFF) | (
+            attr_type << 12
+        )
+    else:
+        attribute_flags = _tagdescr_map_attribute_flags(attribute_flags_wire, offset_info_type)
+
+    element = VartypeListElement(
+        lid=lid,
+        symbol_crc=0,
+        softdatatype=soft_datatype,
+        attribute_flags=attribute_flags,
+        bitoffsetinfo_flags=_tagdescr_map_bitoffset_flags(attribute_flags_wire),
+        offset_info=offset_info,
+    )
+
+    if offset < len(data) and data[offset] == TERMINATING_TAG_DESCRIPTION:
+        offset += 1
+    return name, element, offset
 
 
 def parse_varname_list(data: bytes, offset: int) -> tuple[list[str], int]:
@@ -564,6 +908,7 @@ class PObject:
     relation_id: int = 0
     class_id: int = 0
     attributes: dict[int, bytes] = field(default_factory=dict)
+    relations: dict[int, int] = field(default_factory=dict)
     vartype_list: list[VartypeListElement] = field(default_factory=list)
     varname_list: list[str] = field(default_factory=list)
     objects: list["PObject"] = field(default_factory=list)
@@ -596,6 +941,25 @@ def parse_object(data: bytes, offset: int) -> tuple[PObject, int]:
             value, consumed = decode_pvalue_to_bytes(data, offset)
             offset += consumed
             obj.attributes[attr_id] = value
+        elif tag == RELATION:
+            # A4: relation id (VLQ) + fixed 4-byte value. Seen on FW2.x type info.
+            offset += 1
+            rel_id, consumed = decode_uint32_vlq(data, offset)
+            offset += consumed
+            if offset + 4 > len(data):
+                raise ValueError("Truncated Relation value")
+            (rel_value,) = struct.unpack_from(">I", data, offset)
+            offset += 4
+            obj.relations[rel_id] = rel_value
+        elif tag == START_OF_TAG_DESCRIPTION:
+            # Legacy S7-1200 FW2.x TypeInfo uses A7/A8 instead of packed AB/AC lists.
+            offset += 1
+            name, element, offset = parse_tag_description(data, offset)
+            obj.vartype_list.append(element)
+            obj.varname_list.append(name)
+        elif tag == TERMINATING_TAG_DESCRIPTION:
+            # Normally consumed inside parse_tag_description; tolerate a stray trailer.
+            offset += 1
         elif tag == VARTYPE_LIST:
             offset += 1
             obj.vartype_list, offset = parse_vartype_list(data, offset)
