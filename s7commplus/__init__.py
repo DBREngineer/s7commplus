@@ -30,6 +30,7 @@ from .client import DBWriteItem, OperatingStateChange, ProgramObject, SymbolicRe
 from .client import S7CommPlusClient as Client
 from .connection import S7CommPlusConnection
 from .devices import DEVICE_NAMES, device_family, device_name
+from .metadata import CpuCultureInfo, CpuCycleTime, CpuInfo, CpuMemoryArea, CpuMemoryUsage
 from .error import (
     S7AuthenticationError,
     S7CertificateError,
@@ -71,6 +72,11 @@ __all__ = [
     "BlockInterfaceError",
     "CPUState",
     "Client",
+    "CpuCultureInfo",
+    "CpuCycleTime",
+    "CpuInfo",
+    "CpuMemoryArea",
+    "CpuMemoryUsage",
     "DBWriteItem",
     "DataBlock",
     "DEVICE_NAMES",

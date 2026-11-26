@@ -872,6 +872,121 @@ class S7CommPlusAsyncClient(_ClientMethods):
         parse_or_raise_for_return_value(response, "CPU state read")
         return _parse_cpu_state(response)
 
+    @_retry_on_dropped_connection
+    async def get_cpu_info(self):
+        """Read PLC identity (MLFB, serial, firmware, optional project metadata)."""
+        from .metadata import CpuInfo, get_var_substreamed_async, parse_cpu_identification_blob, uses_old_firmware_gvs_framing
+        from .metadata import _as_wstring, _gvs_request, _parse_wstring_array
+        from .protocol import DataType
+
+        connection = self._require_connected()
+        ident = await get_var_substreamed_async(connection, Ids.NATIVE_THE_CPU_PROXY_RID, Ids.CPU_PROXY_IDENTIFICATION)
+        if ident.datatype != DataType.BLOB:
+            raise S7ProtocolError(f"CPU identification is not a BLOB (datatype=0x{ident.datatype:02X})")
+        mlfb, serial, firmware = parse_cpu_identification_blob(ident.raw)
+        plc_name = None
+        try:
+            plc_name = _as_wstring(
+                await get_var_substreamed_async(connection, Ids.NATIVE_THE_CPU_COMMON_RID, Ids.CPU_COMMON_PLC_NAME)
+            )
+        except (S7ConnectionError, S7ProtocolError):
+            if not uses_old_firmware_gvs_framing(connection):
+                raise
+        version_tia = version2 = project_name = None
+        if not uses_old_firmware_gvs_framing(connection):
+            versions = await get_var_substreamed_async(connection, Ids.NATIVE_THE_AS_ROOT_RID, Ids.AS_ROOT_VERSIONS)
+            if not (versions.flags & 0x10) or versions.datatype != DataType.USINT or len(versions.raw) < 8:
+                raise S7ProtocolError("ASRoot versions reply is not an 8-byte USINT array")
+            version_tia = (versions.raw[0], versions.raw[1], versions.raw[2], versions.raw[3])
+            version2 = (versions.raw[4], versions.raw[5], versions.raw[6], versions.raw[7])
+            payload, tail = _gvs_request(connection, Ids.RELEASE_MANAGEMENT_ROOT_RID, Ids.RELEASE_MANAGEMENT_VERSIONS_AND_NAME)
+            response = await connection.send_request(FunctionCode.GET_VAR_SUBSTREAMED, payload, integrity_tail=tail)
+            try:
+                names = _parse_wstring_array(response)
+                if len(names) > 2:
+                    project_name = names[2]
+            except (S7ConnectionError, S7ProtocolError):
+                project_name = None
+        return CpuInfo(
+            mlfb=mlfb,
+            serial=serial,
+            firmware=firmware,
+            plc_name=plc_name,
+            project_name=project_name,
+            version_tia=version_tia,
+            version2=version2,
+        )
+
+    @_retry_on_dropped_connection
+    async def get_cpu_cycle_time(self):
+        """Read scan-cycle statistics from theCPUexecUnit."""
+        from .metadata import CpuCycleTime, get_var_substreamed_async, _as_milliseconds
+
+        connection = self._require_connected()
+
+        async def optional(address: int):
+            try:
+                return _as_milliseconds(await get_var_substreamed_async(connection, Ids.NATIVE_THE_CPU_EXEC_UNIT_RID, address))
+            except (S7ConnectionError, S7ProtocolError):
+                return None
+
+        return CpuCycleTime(
+            shortest_ms=_as_milliseconds(
+                await get_var_substreamed_async(
+                    connection, Ids.NATIVE_THE_CPU_EXEC_UNIT_RID, Ids.CPU_EXEC_UNIT_SHORTEST_SCAN_CYCLE
+                )
+            ),
+            current_ms=_as_milliseconds(
+                await get_var_substreamed_async(
+                    connection, Ids.NATIVE_THE_CPU_EXEC_UNIT_RID, Ids.CPU_EXEC_UNIT_CURRENT_SCAN_CYCLE
+                )
+            ),
+            longest_ms=_as_milliseconds(
+                await get_var_substreamed_async(
+                    connection, Ids.NATIVE_THE_CPU_EXEC_UNIT_RID, Ids.CPU_EXEC_UNIT_LONGEST_SCAN_CYCLE
+                )
+            ),
+            configured_minimum_ms=await optional(Ids.CPU_EXEC_UNIT_CONFIGURED_MIN_SCAN_CYCLE),
+            configured_maximum_ms=await optional(Ids.CPU_EXEC_UNIT_CONFIGURED_MAX_SCAN_CYCLE),
+        )
+
+    @_retry_on_dropped_connection
+    async def get_cpu_memory_usage(self):
+        """Read CPU load/work/retain memory totals and usage."""
+        from .metadata import CpuMemoryArea, CpuMemoryUsage, get_var_substreamed_async, _MEMORY_AREAS, _as_number
+
+        connection = self._require_connected()
+        areas = []
+        for key, name, total_aid, used_aid in _MEMORY_AREAS:
+            try:
+                total = int(
+                    _as_number(await get_var_substreamed_async(connection, Ids.NATIVE_THE_CPU_COMMON_RID, total_aid))
+                )
+                used = int(_as_number(await get_var_substreamed_async(connection, Ids.NATIVE_THE_CPU_COMMON_RID, used_aid)))
+            except (S7ConnectionError, S7ProtocolError):
+                continue
+            if total <= 0:
+                continue
+            areas.append(CpuMemoryArea(key=key, name=name, total_bytes=total, used_bytes=max(0, used)))
+        if not areas:
+            raise S7ProtocolError("PLC reported no readable CPU memory areas")
+        return CpuMemoryUsage(areas=tuple(areas))
+
+    @_retry_on_dropped_connection
+    async def get_cpu_culture_info(self):
+        """Read the language IDs advertised by the PLC text container."""
+        from .error import S7ReturnValueError
+        from .metadata import build_text_container_explore_payload, parse_text_container_lcids, CpuCultureInfo
+
+        connection = self._require_connected()
+        payload = build_text_container_explore_payload()
+        response = await connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
+        try:
+            parse_or_raise_for_return_value(response, "CPU culture info")
+        except S7ReturnValueError:
+            return CpuCultureInfo(language_ids=())
+        return parse_text_container_lcids(response)
+
     async def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
 

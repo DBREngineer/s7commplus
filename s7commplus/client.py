@@ -51,6 +51,7 @@ from .codec import (
     skip_typed_value,
 )
 from .catalog import SymbolCatalog, SymbolicTag, TagResult, _write_type
+from .metadata import CpuCultureInfo, CpuCycleTime, CpuInfo, CpuMemoryUsage
 from .values import assemble, split
 from .connection import (
     FamilyOnlyFingerprintError,
@@ -1780,6 +1781,39 @@ class S7CommPlusClient(_ClientMethods):
         response = connection.send_request(FunctionCode.EXPLORE, payload, integrity_tail=5, reassemble=True)
         parse_or_raise_for_return_value(response, "CPU state read")
         return _parse_cpu_state(response)
+
+    @_retry_on_dropped_connection
+    def get_cpu_info(self) -> CpuInfo:
+        """Read PLC identity (MLFB, serial, firmware, optional project metadata).
+
+        Uses CPUProxy AID 3753 first. On plaintext S7-1200 FW2.x sessions the
+        ASRoot / ReleaseMngmt reads are skipped because they can RST the TCP
+        session (S7CommPlusDriver PR #25).
+        """
+        from .metadata import read_cpu_info
+
+        return read_cpu_info(self._require_connected())
+
+    @_retry_on_dropped_connection
+    def get_cpu_cycle_time(self) -> CpuCycleTime:
+        """Read scan-cycle statistics from theCPUexecUnit."""
+        from .metadata import read_cpu_cycle_time
+
+        return read_cpu_cycle_time(self._require_connected())
+
+    @_retry_on_dropped_connection
+    def get_cpu_memory_usage(self) -> CpuMemoryUsage:
+        """Read CPU load/work/retain memory totals and usage."""
+        from .metadata import read_cpu_memory_usage
+
+        return read_cpu_memory_usage(self._require_connected())
+
+    @_retry_on_dropped_connection
+    def get_cpu_culture_info(self) -> CpuCultureInfo:
+        """Read the language IDs advertised by the PLC text container."""
+        from .metadata import read_cpu_culture_info
+
+        return read_cpu_culture_info(self._require_connected())
 
     def request_operating_state(self, state: int) -> OperatingStateChange:
         """Send an operating-state (RUN/STOP) request and return the raw exchange.
