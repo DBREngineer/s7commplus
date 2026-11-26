@@ -15,7 +15,7 @@ Usage::
 
 from .async_client import AsyncSubscriptionQueue
 from .async_client import S7CommPlusAsyncClient as AsyncClient
-from .alarm import Alarm, AlarmNotification, AlarmText, LanguageId
+from .alarm import Alarm, AlarmNotification, AlarmText, LanguageId, format_alarm_text
 from .blob_decompressor import (
     PresetStream,
     decompress_blob,
@@ -129,6 +129,7 @@ __all__ = [
     "device_name",
     "find_and_decompress",
     "find_preset_stream",
+    "format_alarm_text",
     "iter_preset_headers",
     "iter_preset_streams",
     "resolve_id_path",

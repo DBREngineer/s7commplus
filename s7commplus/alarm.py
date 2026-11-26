@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
@@ -15,7 +14,9 @@ from .vlq import decode_int32_vlq, decode_int64_vlq, decode_uint32_vlq, decode_u
 
 _ALARM_SUBSCRIPTION_RELATION_ID = 0x7FFFC001
 _ALARM_REFERENCE_RELATION_ID = 0x51010001
-_ASSOCIATED_VALUE_TOKEN = re.compile(r"@(\d+)(%[^@]+)@")
+_ELEMENT_TYPES = frozenset("BCDIORTWXY")
+_DISPLAY_FORMATS = frozenset("bdfsuxX")
+_MAX_TEXT_LIST_RECURSION = 8
 
 _SOFTDATATYPE_BOOL = 0x02000001
 _SOFTDATATYPE_BYTE = 0x02000002
@@ -432,24 +433,183 @@ def _decode_associated_value(blob: _Blob) -> object | None:
     return None
 
 
-def _interpolate_associated_values(text: str, values: Sequence[_Blob]) -> str:
-    def replace(match: re.Match[str]) -> str:
-        index = int(match.group(1))
-        if index >= len(values):
-            return match.group(0)
-        value = _decode_associated_value(values[index])
-        if value is None:
-            return match.group(0)
-        try:
-            return match.group(2) % value
-        except (TypeError, ValueError):
-            return match.group(0)
+def format_alarm_text(
+    text: str,
+    values: Sequence[_Blob],
+    language_id: int = 0,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+    *,
+    _depth: int = 0,
+) -> str:
+    """Format TIA alarm placeholders (``@1%d@``, ``@1W%t#42@``, …).
 
-    return _ASSOCIATED_VALUE_TOKEN.sub(replace, text)
+    When ``text_list_resolver`` is set (typically
+    :meth:`s7commplus.TextListCatalog.resolve_text`), ``%t#`` placeholders are
+    replaced. Nested text-list results are formatted recursively up to a
+    small depth limit.
+    """
+    if not text or not values:
+        return text
+
+    out: list[str] = []
+    copied = 0
+    search = 0
+    while search < len(text):
+        start = text.find("@", search)
+        if start < 0:
+            break
+        parsed = _parse_placeholder(text, start)
+        if parsed is None:
+            search = start + 1
+            continue
+        index, element_type, width_text, precision_text, fmt, end, is_text_list, list_name = parsed
+        original = text[start:end]
+        if index >= len(values):
+            search = end
+            continue
+        decoded = _decode_associated_value(values[index])
+
+        if is_text_list:
+            if decoded is None or text_list_resolver is None:
+                search = end
+                continue
+            int_value = int(decoded) if isinstance(decoded, (int, bool)) else None
+            if int_value is None:
+                search = end
+                continue
+            resolved = text_list_resolver(list_name, int_value, language_id)
+            if resolved is None:
+                search = end
+                continue
+            if _depth < _MAX_TEXT_LIST_RECURSION:
+                resolved = format_alarm_text(
+                    resolved, values, language_id, text_list_resolver, _depth=_depth + 1
+                )
+            out.append(text[copied:start])
+            out.append(resolved)
+            copied = end
+            search = end
+            continue
+
+        if decoded is None:
+            search = end
+            continue
+        replacement = _format_placeholder_value(
+            decoded, element_type, fmt, width_text, precision_text, original
+        )
+        out.append(text[copied:start])
+        out.append(replacement)
+        copied = end
+        search = end
+
+    if copied == 0:
+        return text
+    out.append(text[copied:])
+    return "".join(out)
+
+
+def _parse_placeholder(
+    text: str, start: int
+) -> tuple[int, str | None, str, str, str, int, bool, str] | None:
+    """Parse one ``@…@`` placeholder starting at ``start``."""
+    pos = start + 1
+    if pos >= len(text) or not text[pos].isdigit():
+        return None
+    index_start = pos
+    while pos < len(text) and text[pos].isdigit():
+        pos += 1
+    try:
+        index = int(text[index_start:pos])
+    except ValueError:
+        return None
+
+    element_type: str | None = None
+    if pos < len(text) and text[pos] in _ELEMENT_TYPES:
+        element_type = text[pos]
+        pos += 1
+    if pos >= len(text) or text[pos] != "%":
+        return None
+    pos += 1
+
+    width_start = pos
+    while pos < len(text) and text[pos].isdigit():
+        pos += 1
+    width_text = text[width_start:pos]
+    precision_text = ""
+    if pos < len(text) and text[pos] == ".":
+        pos += 1
+        precision_start = pos
+        while pos < len(text) and text[pos].isdigit():
+            pos += 1
+        precision_text = text[precision_start:pos]
+    if pos >= len(text):
+        return None
+
+    if text[pos] == "t" and pos + 1 < len(text) and text[pos + 1] == "#":
+        end = text.find("@", pos + 2)
+        if end < 0:
+            return None
+        return index, element_type, width_text, precision_text, "\0", end + 1, True, text[pos + 2 : end]
+
+    if text[pos] not in _DISPLAY_FORMATS:
+        return None
+    fmt = text[pos]
+    pos += 1
+    if pos >= len(text) or text[pos] != "@":
+        return None
+    return index, element_type, width_text, precision_text, fmt, pos + 1, False, ""
+
+
+def _format_placeholder_value(
+    value: Any,
+    element_type: str | None,
+    fmt: str,
+    width_text: str,
+    precision_text: str,
+    original: str,
+) -> str:
+    """Format one non-text-list placeholder value."""
+    # Preserve the historical printf path for simple %d/%s cases.
+    if not element_type and not width_text and not precision_text and fmt in "dfsuxX":
+        try:
+            return ("%" + fmt) % value
+        except (TypeError, ValueError):
+            pass
+
+    width = int(width_text) if width_text else 0
+    pad = "0" if width_text.startswith("0") else " "
+    if fmt == "d":
+        return str(int(value)).rjust(width, pad) if width else str(int(value))
+    if fmt == "u":
+        return str(int(value) & 0xFFFFFFFF).rjust(width, pad) if width else str(int(value) & 0xFFFFFFFF)
+    if fmt in ("x", "X"):
+        return "16#" + format(int(value) & 0xFFFFFFFF, "X").rjust(max(width, 1), "0")
+    if fmt == "b":
+        bits = format(int(value) & 0xFFFFFFFF, "b")
+        return "2#" + bits.rjust(width, "0") if width else "2#" + bits
+    if fmt == "f":
+        precision = int(precision_text) if precision_text else 6
+        return format(float(value), f".{precision}f").rjust(width, pad) if width else format(float(value), f".{precision}f")
+    if fmt == "s":
+        text = value if isinstance(value, str) else str(value)
+        return text.rjust(width, pad) if width > len(text) else text
+    return original
+
+
+def _interpolate_associated_values(
+    text: str,
+    values: Sequence[_Blob],
+    language_id: int = 0,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+) -> str:
+    return format_alarm_text(text, values, language_id, text_list_resolver)
 
 
 def _alarm_texts(
-    value: Any, language_ids: set[LanguageId | int] | None, associated_values: Sequence[_Blob]
+    value: Any,
+    language_ids: set[LanguageId | int] | None,
+    associated_values: Sequence[_Blob],
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
 ) -> dict[int, AlarmText]:
     grouped: dict[int, dict[int, str]] = {}
     if not isinstance(value, dict):
@@ -461,7 +621,9 @@ def _alarm_texts(
         if language_ids is not None and language_id not in language_ids:
             continue
         text = blob.value.decode("utf-8", errors="replace")
-        grouped.setdefault(language_id, {})[text_id] = _interpolate_associated_values(text, associated_values)
+        grouped.setdefault(language_id, {})[text_id] = _interpolate_associated_values(
+            text, associated_values, language_id, text_list_resolver
+        )
     result = {}
     for language_id, texts in grouped.items():
         additional = tuple(texts.get(i, "") for i in range(3, 12))
@@ -469,7 +631,11 @@ def _alarm_texts(
     return result
 
 
-def _alarm_from_object(obj: _Object, language_ids: set[LanguageId | int] | None) -> Alarm:
+def _alarm_from_object(
+    obj: _Object,
+    language_ids: set[LanguageId | int] | None,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+) -> Alarm:
     attrs = obj.attributes
     state_id = Ids.ALARM_DAI_COMING if Ids.ALARM_DAI_COMING in attrs else Ids.ALARM_DAI_GOING
     state_value = attrs.get(state_id)
@@ -498,24 +664,38 @@ def _alarm_from_object(obj: _Object, language_ids: set[LanguageId | int] | None)
         acknowledge_timestamp=acknowledge_timestamp,
         hmi_info=hmi.value if isinstance(hmi, _Blob) else b"",
         associated_values=tuple(blob.value for blob in associated_blobs),
-        texts=_alarm_texts(attrs.get(Ids.ALARM_DAI_TEXTS), language_ids, associated_blobs),
+        texts=_alarm_texts(
+            attrs.get(Ids.ALARM_DAI_TEXTS), language_ids, associated_blobs, text_list_resolver
+        ),
     )
 
 
-def parse_alarm_explore_response(response: bytes, language_ids: Sequence[LanguageId | int] | None = None) -> list[Alarm]:
+def parse_alarm_explore_response(
+    response: bytes,
+    language_ids: Sequence[LanguageId | int] | None = None,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+) -> list[Alarm]:
     """Parse the payload returned by an alarm-subsystem EXPLORE request.
+
+    Args:
+        text_list_resolver: Optional ``(name, value, language_id) -> text`` used
+            for ``@n%t#list@`` placeholders (e.g. ``TextListCatalog.resolve_text``).
 
     Raises:
         S7ReturnValueError: If the ReturnValue is non-zero.
         ValueError: If the response is truncated or malformed.
     """
     try:
-        return _parse_alarm_explore_response(response, language_ids)
+        return _parse_alarm_explore_response(response, language_ids, text_list_resolver)
     except (struct.error, IndexError) as exc:
         raise ValueError(f"Alarm browse response is truncated or malformed: {exc}") from exc
 
 
-def _parse_alarm_explore_response(response: bytes, language_ids: Sequence[LanguageId | int] | None) -> list[Alarm]:
+def _parse_alarm_explore_response(
+    response: bytes,
+    language_ids: Sequence[LanguageId | int] | None,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+) -> list[Alarm]:
     offset = parse_or_raise_for_return_value(response, "Alarm browse")
     if offset + 4 > len(response):
         raise ValueError("Alarm browse response is truncated")
@@ -525,22 +705,34 @@ def _parse_alarm_explore_response(response: bytes, language_ids: Sequence[Langua
         _, offset = _read_vlq32(response, offset)
     objects, _ = _decode_objects(response, offset)
     wanted = set(language_ids) if language_ids is not None else None
-    return [_alarm_from_object(obj, wanted) for obj in objects if obj.class_id == Ids.ALARM_DAI_CLASS_RID]
+    return [
+        _alarm_from_object(obj, wanted, text_list_resolver)
+        for obj in objects
+        if obj.class_id == Ids.ALARM_DAI_CLASS_RID
+    ]
 
 
-def parse_alarm_notification(frame: bytes, language_ids: Sequence[LanguageId | int] | None = None) -> AlarmNotification:
+def parse_alarm_notification(
+    frame: bytes,
+    language_ids: Sequence[LanguageId | int] | None = None,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+) -> AlarmNotification:
     """Parse one complete S7CommPlus notification frame.
 
     Raises:
         ValueError: If the frame is not a notification, or is truncated or malformed.
     """
     try:
-        return _parse_alarm_notification(frame, language_ids)
+        return _parse_alarm_notification(frame, language_ids, text_list_resolver)
     except (struct.error, IndexError) as exc:
         raise ValueError(f"Alarm notification is truncated or malformed: {exc}") from exc
 
 
-def _parse_alarm_notification(frame: bytes, language_ids: Sequence[LanguageId | int] | None) -> AlarmNotification:
+def _parse_alarm_notification(
+    frame: bytes,
+    language_ids: Sequence[LanguageId | int] | None,
+    text_list_resolver: Callable[[str, int, int], str | None] | None = None,
+) -> AlarmNotification:
     if len(frame) < 5 or frame[0] != 0x72:
         raise ValueError("Invalid S7CommPlus notification frame")
     data_length = struct.unpack_from(">H", frame, 2)[0]
@@ -578,7 +770,11 @@ def _parse_alarm_notification(frame: bytes, language_ids: Sequence[LanguageId | 
         offset += 1
         objects, _ = _decode_objects(data, offset)
         wanted = set(language_ids) if language_ids is not None else None
-        alarms = [_alarm_from_object(obj, wanted) for obj in objects if obj.class_id == Ids.ALARM_DAI_CLASS_RID]
+        alarms = [
+            _alarm_from_object(obj, wanted, text_list_resolver)
+            for obj in objects
+            if obj.class_id == Ids.ALARM_DAI_CLASS_RID
+        ]
         if subscription_id == 0:
             subscription_id = alarm_subscription_id
     return AlarmNotification(subscription_id, credit_tick, sequence_number, change_counter, timestamp, tuple(alarms))

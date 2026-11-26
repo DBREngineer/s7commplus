@@ -5,14 +5,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from s7commplus import Alarm, AlarmNotification, AlarmText, LanguageId
+from s7commplus import Alarm, AlarmNotification, AlarmText, LanguageId, format_alarm_text
 from s7commplus.alarm import (
+    _Blob,
     build_alarm_explore_request,
     build_alarm_subscription_request,
     build_delete_alarm_subscription_request,
     parse_alarm_explore_response,
     parse_alarm_notification,
 )
+from s7commplus.textlists import TextList, TextListCatalog, TextListEntry, TextListScope, TextListType
 from s7commplus.async_client import S7CommPlusAsyncClient
 from s7commplus.client import S7CommPlusClient
 from s7commplus.error import S7ReturnValueError
@@ -429,3 +431,25 @@ def test_sync_alarm_methods_require_connection(method: str, args: tuple[object, 
     client = S7CommPlusClient()
     with pytest.raises(RuntimeError, match="Not connected"):
         getattr(client, method)(*args)
+
+
+def test_format_alarm_text_resolves_text_list_placeholders() -> None:
+    catalog = TextListCatalog(
+        (1031,),
+        (
+            TextList(
+                42,
+                1031,
+                TextListScope.LANGUAGE_SPECIFIC,
+                TextListType.USER,
+                (TextListEntry(4, 4, "OK"),),
+            ),
+        ),
+    )
+    values = (
+        _Blob(1, b""),
+        _Blob(0x02000005, struct.pack(">h", 4)),
+    )
+    assert format_alarm_text("State @1%t#42@", values, 1031, catalog.resolve_text) == "State OK"
+    assert format_alarm_text("State @1W%t#42@", values, 1031, catalog.resolve_text) == "State OK"
+    assert format_alarm_text("n=@1%d@", values, 1031) == "n=4"

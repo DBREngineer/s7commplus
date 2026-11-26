@@ -1428,8 +1428,16 @@ class S7CommPlusAsyncClient(_ClientMethods):
                 continue
             return parse_alarm_notification(frame, language_ids)
 
-    async def read_alarms(self, language_ids: Optional[list[LanguageId | int]] = None) -> list[Alarm]:
+    async def read_alarms(
+        self,
+        language_ids: Optional[list[LanguageId | int]] = None,
+        *,
+        text_lists: Any = None,
+    ) -> list[Alarm]:
         """Return a snapshot of the PLC's active alarms without consuming notifications.
+
+        Args:
+            text_lists: Optional :class:`~s7commplus.TextListCatalog` for ``%t#`` placeholders.
 
         Raises:
             S7ReturnValueError: If the PLC answers with a non-zero ReturnValue.
@@ -1438,7 +1446,8 @@ class S7CommPlusAsyncClient(_ClientMethods):
         response = await connection.send_request(
             FunctionCode.EXPLORE, build_alarm_explore_request(), integrity_tail=5, reassemble=True
         )
-        return parse_alarm_explore_response(response, language_ids)
+        resolver = text_lists.resolve_text if text_lists is not None else None
+        return parse_alarm_explore_response(response, language_ids, resolver)
 
     @_retry_on_dropped_connection
     async def read_symbolic(self, access_area: int, lids: list[int], symbol_crc: int = 0) -> bytes:

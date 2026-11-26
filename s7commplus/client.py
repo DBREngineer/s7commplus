@@ -2460,7 +2460,12 @@ class S7CommPlusClient(_ClientMethods):
             raise S7TimeoutError(f"No notification from the PLC within {wait}s")
         return self._connection.receive_notification(left)
 
-    def read_alarms(self, language_ids: Optional[list[LanguageId | int]] = None) -> list[Alarm]:
+    def read_alarms(
+        self,
+        language_ids: Optional[list[LanguageId | int]] = None,
+        *,
+        text_lists: Any = None,
+    ) -> list[Alarm]:
         """Return the PLC's current active alarm state.
 
         This is a snapshot read and does not create or consume a subscription,
@@ -2469,13 +2474,16 @@ class S7CommPlusClient(_ClientMethods):
         Args:
             language_ids: Optional Windows LCIDs used to filter returned texts.
                 Omitting the filter retains every language sent by the PLC.
+            text_lists: Optional :class:`~s7commplus.TextListCatalog` used to
+                resolve ``@n%t#list@`` placeholders in alarm texts.
 
         Raises:
             S7ReturnValueError: If the PLC answers with a non-zero ReturnValue.
         """
         connection = self._require_connected()
         response = connection.send_request(FunctionCode.EXPLORE, build_alarm_explore_request(), integrity_tail=5, reassemble=True)
-        return parse_alarm_explore_response(response, language_ids)
+        resolver = text_lists.resolve_text if text_lists is not None else None
+        return parse_alarm_explore_response(response, language_ids, resolver)
 
     def __enter__(self) -> "S7CommPlusClient":
         return self
